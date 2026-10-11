@@ -964,11 +964,15 @@ async def settings_center(message: Message):
         [InlineKeyboardButton(text="🎲 随机文件夹数量", callback_data="settings_random_count")],
         [InlineKeyboardButton(text="📦 文件夹解锁价格", callback_data="settings_source_price")],
         [InlineKeyboardButton(text="⏱️ 解锁后浏览时长", callback_data="settings_browse_limit")],
+        [InlineKeyboardButton(text="📅 每日解锁上限", callback_data="settings_daily_unlock_limit")],
+        [InlineKeyboardButton(text="🧩 用户菜单管理", callback_data="settings_menu_manage")],
+        [InlineKeyboardButton(text="📢 公告文案", callback_data="settings_text:announcement_text"), InlineKeyboardButton(text="🆘 客服链接", callback_data="settings_text:support_url")],
         [InlineKeyboardButton(text="✏️ 修改欢迎文案", callback_data="settings_text:welcome_text"), InlineKeyboardButton(text="💡 修改帮助文案", callback_data="settings_text:help_text")],
         [InlineKeyboardButton(text="🖼️ 设置欢迎图片", callback_data="settings_welcome_image")],
         [InlineKeyboardButton(text="🎟️ 兑换码管理", callback_data="codes_manage")],
         [InlineKeyboardButton(text="📚 资源仓库管理", callback_data="source_repo_manage")],
         [InlineKeyboardButton(text="👥 用户与积分管理", callback_data="admin_users")],
+        [InlineKeyboardButton(text="💾 发送数据库备份", callback_data="admin_db_backup")],
         [InlineKeyboardButton(text="📋 查看当前设置", callback_data="settings_show")],
     ])
     await message.answer("⚙️ 悦己设置中心\n━━━━━━━━━━━━━━\n请选择要调整的项目。大部分设置可直接点击完成。", reply_markup=kb)
@@ -986,11 +990,15 @@ async def settings_home_callback(callback: CallbackQuery):
         [InlineKeyboardButton(text="🎲 随机文件夹数量", callback_data="settings_random_count")],
         [InlineKeyboardButton(text="📦 文件夹解锁价格", callback_data="settings_source_price")],
         [InlineKeyboardButton(text="⏱️ 解锁后浏览时长", callback_data="settings_browse_limit")],
+        [InlineKeyboardButton(text="📅 每日解锁上限", callback_data="settings_daily_unlock_limit")],
+        [InlineKeyboardButton(text="🧩 用户菜单管理", callback_data="settings_menu_manage")],
+        [InlineKeyboardButton(text="📢 公告文案", callback_data="settings_text:announcement_text"), InlineKeyboardButton(text="🆘 客服链接", callback_data="settings_text:support_url")],
         [InlineKeyboardButton(text="✏️ 修改欢迎文案", callback_data="settings_text:welcome_text"), InlineKeyboardButton(text="💡 修改帮助文案", callback_data="settings_text:help_text")],
         [InlineKeyboardButton(text="🖼️ 设置欢迎图片", callback_data="settings_welcome_image")],
         [InlineKeyboardButton(text="🎟️ 兑换码管理", callback_data="codes_manage")],
         [InlineKeyboardButton(text="📚 资源仓库管理", callback_data="source_repo_manage")],
         [InlineKeyboardButton(text="👥 用户与积分管理", callback_data="admin_users")],
+        [InlineKeyboardButton(text="💾 发送数据库备份", callback_data="admin_db_backup")],
         [InlineKeyboardButton(text="📋 查看当前设置", callback_data="settings_show")],
     ])
     await callback.message.edit_text("⚙️ 悦己设置中心\n━━━━━━━━━━━━━━\n请选择要调整的项目。", reply_markup=kb)
@@ -1421,6 +1429,138 @@ async def settings_source_price(callback: CallbackQuery):
     current = await get_config("source_folder_price", "10")
     await callback.message.edit_text(f"📦 当前每个资源文件夹解锁价格：{current} 积分\n请选择新价格：", reply_markup=kb)
     await callback.answer()
+
+
+@dp.callback_query(F.data == "settings_daily_unlock_limit")
+async def settings_daily_unlock_limit(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    current = await get_config("daily_unlock_limit", "0")
+    label = "不限量" if current == "0" else f"每天最多 {current} 个文件夹"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="不限量", callback_data="cfgset:daily_unlock_limit:0"),
+            InlineKeyboardButton(text="1 个", callback_data="cfgset:daily_unlock_limit:1"),
+            InlineKeyboardButton(text="3 个", callback_data="cfgset:daily_unlock_limit:3"),
+        ],
+        [
+            InlineKeyboardButton(text="5 个", callback_data="cfgset:daily_unlock_limit:5"),
+            InlineKeyboardButton(text="10 个", callback_data="cfgset:daily_unlock_limit:10"),
+            InlineKeyboardButton(text="自定义", callback_data="settings_daily_unlock_custom"),
+        ],
+        [InlineKeyboardButton(text="↩️ 返回设置中心", callback_data="settings_home")],
+    ])
+    await callback.message.edit_text(
+        f"📅 每日文件夹解锁上限\n当前：{label}\n\n"
+        "设置为 0 表示不限量。该上限只统计当天新解锁的文件夹；已解锁文件夹不会重复扣积分。",
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settings_daily_unlock_custom")
+async def settings_daily_unlock_custom(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    pending_config[callback.from_user.id] = "daily_unlock_limit"
+    await callback.message.answer("请发送每日最多解锁的文件夹数量（0–1000；0 表示不限量）。发送「取消设置」可退出。")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settings_menu_manage")
+async def settings_menu_manage(callback: CallbackQuery, answer_callback: bool = True):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    items = [
+        ("menu_my_info_text", "menu_show_my_info", "我的信息"),
+        ("menu_checkin_text", "menu_show_checkin", "每日签到"),
+        ("menu_random_text", "menu_show_random", "随机资源"),
+        ("menu_buy_text", "menu_show_buy", "购买积分"),
+        ("menu_help_text", "menu_show_help", "用户帮助"),
+    ]
+    lines = ["🧩 用户菜单管理", "━━━━━━━━━━━━━━"]
+    buttons = []
+    for text_key, show_key, title in items:
+        label = await get_config(text_key, DEFAULT_CONFIG[text_key])
+        visible = await get_config(show_key, "1") == "1"
+        lines.append(f"{'🟢 显示' if visible else '⚪️ 隐藏'}｜{title}：{label}")
+        buttons.append([
+            InlineKeyboardButton(text=f"✏️ 改名：{title}", callback_data=f"settings_menu_label:{text_key}"),
+            InlineKeyboardButton(text=("隐藏" if visible else "显示") + f"：{title}", callback_data=f"menu_toggle:{show_key}:{'0' if visible else '1'}"),
+        ])
+    buttons.append([InlineKeyboardButton(text="↩️ 返回设置中心", callback_data="settings_home")])
+    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    if answer_callback:
+        await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("settings_menu_label:"))
+async def settings_menu_label(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    key = callback.data.split(":", 1)[1]
+    if key not in ("menu_my_info_text", "menu_checkin_text", "menu_random_text", "menu_buy_text", "menu_help_text"):
+        await callback.answer("菜单设置项无效", show_alert=True)
+        return
+    pending_config[callback.from_user.id] = key
+    await callback.message.answer("请发送新的菜单按钮名称（最多 32 个字符，不能与其他菜单重名）。发送「取消设置」可退出。")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("menu_toggle:"))
+async def settings_menu_toggle(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    try:
+        _, key, value = callback.data.split(":", 2)
+    except ValueError:
+        await callback.answer("菜单设置参数无效", show_alert=True)
+        return
+    normalized, error = await validate_config_value(key, value)
+    if error:
+        await callback.answer(error, show_alert=True)
+        return
+    await set_config(key, normalized)
+    await callback.answer("菜单显示状态已保存")
+    await settings_menu_manage(callback, answer_callback=False)
+
+
+@dp.callback_query(F.data == "admin_db_backup")
+async def admin_db_backup(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    import tempfile
+    from aiogram.types import FSInputFile
+    backup_path = None
+    try:
+        handle = tempfile.NamedTemporaryFile(prefix="yueji-backup-", suffix=".db", delete=False)
+        backup_path = handle.name
+        handle.close()
+        async with aiosqlite.connect(DB_PATH) as source:
+            async with aiosqlite.connect(backup_path) as target:
+                await source.backup(target)
+        filename = "yueji-backup-" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".db"
+        await bot.send_document(
+            callback.from_user.id,
+            FSInputFile(backup_path, filename=filename),
+            caption="悦己数据库备份。请妥善保管，文件包含用户积分、兑换码及解锁记录。",
+        )
+        await callback.answer("备份已发送给管理员")
+    except Exception as exc:
+        await callback.answer("备份失败，请检查机器人私聊权限和磁盘空间。", show_alert=True)
+        print("Database backup failed:", str(exc)[:250])
+    finally:
+        if backup_path and os.path.exists(backup_path):
+            try:
+                os.remove(backup_path)
+            except OSError:
+                pass
 
 
 @dp.callback_query(F.data == "settings_browse_limit")
