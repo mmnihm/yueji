@@ -4,6 +4,9 @@ import random
 import secrets
 import json
 from datetime import date
+from urllib.parse import urlparse, unquote
+
+import aiomysql
 
 import aiosqlite
 from aiogram import Bot, Dispatcher, F
@@ -16,7 +19,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     CallbackQuery,
 )
-from dotenv import load_dotenv
+from dotenv import load_dotenv, dotenv_values
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -39,6 +42,7 @@ DEFAULT_CONFIG = {
     "welcome_text": "🌷 欢迎来到「悦己」\n━━━━━━━━━━━━━━\n✨ 发现喜欢的内容，解锁专属资源\n🎁 每日签到领取积分\n🎲 随机探索精选资源\n👤 随时查看个人积分与解锁记录\n\n👇 请使用下方菜单开始体验",
     "help_text": "💡 悦己使用指南\n━━━━━━━━━━━━━━\n👤 我的信息：查看积分与解锁记录\n🎁 每日签到：每天领取随机积分奖励\n🎲 随机资源：浏览资源并使用积分解锁\n🛍️ 购买积分：查看积分档位并获取兑换码\n🎟️ 积分兑换：在购买积分页面输入兑换码\n\n🔐 解锁成功后，机器人会发送对应资源。\n如有疑问，请联系管理员。",
     "welcome_image_file_id": "",
+    "source_repo_id": "",
 }
 
 
@@ -100,6 +104,29 @@ async def init_db():
             await db.execute(
                 "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", (k, v)
             )
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS source_folders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_folder_id TEXT UNIQUE,
+                name TEXT NOT NULL,
+                item_count INTEGER DEFAULT 0,
+                image_count INTEGER DEFAULT 0,
+                video_count INTEGER DEFAULT 0,
+                file_count INTEGER DEFAULT 0
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS source_resources (
+                resource_key TEXT PRIMARY KEY,
+                folder_id TEXT,
+                chat_id TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                title TEXT,
+                file_type TEXT,
+                data TEXT
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_source_resources_folder ON source_resources(folder_id)")
         await db.commit()
 
 
@@ -116,6 +143,170 @@ async def set_config(key: str, value: str):
             "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, value)
         )
         await db.commit()
+
+
+def source_mysql_settings():
+    # Prefer Yueji's own environment; if absent, read the existing bot's local .env
+    # without printing credentials or modifying the original bot.
+    cfg = {}
+    try:
+        cfg.update({k: v for k, v in dotenv_values("/root/bot/.env").items() if v})
+    except Exception:
+        pass
+    cfg.update({k: v for k, v in os.environ.items() if v})
+    url = str(cfg.get("DATABASE_URL", "") or "").strip()
+    if url:
+        try:
+            u = urlparse(url)
+            return {
+                "host": u.hostname,
+                "port": int(u.port or 3306),
+                "user": unquote(u.username or ""),
+                "password": unquote(u.password or ""),
+                "db": unquote(u.path.lstrip("/")),
+                "charset": "utf8mb4",
+                "connect_timeout": 8,
+            }
+        except Exception:
+            return None
+    host = str(cfg.get("DB_HOST", "") or "").strip()
+    database = str(cfg.get("DB_NAME", "") or "").strip()
+    if not host or not database:
+        return None
+    return {
+        "host": host,
+        "port": int(cfg.get("DB_PORT", 3306) or 3306),
+        "user": str(cfg.get("DB_USER", "root") or "root"),
+        "password": str(cfg.get("DB_PASSWORD", "") or ""),
+        "db": database,
+        "charset": "utf8mb4",
+        "connect_timeout": 8,
+    }
+
+
+async def source_mysql_connect():
+    cfg = source_mysql_settings()
+    if not cfg:
+        raise RuntimeError("未找到原资源机器人的 MySQL 配置。请确认 /root/bot/.env 含 DB_HOST、DB_NAME、DB_USER、DB_PASSWORD，或给悦己配置对应环境变量。")
+    return await aiomysql.connect(**cfg)
+
+
+async def detect_source_repository():
+    # First use the configured repository ID, then try to discover the active repo
+    # from the original bot's saved state in MySQL.
+    saved = str(await get_config("source_repo_id", "") or "").strip()
+    if saved:
+        return saved
+    conn = await source_mysql_connect()
+    try:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT data FROM bot_state ORDER BY updated_at DESC LIMIT 30")
+            rows = await cur.fetchall()
+            for (raw,) in rows:
+                try:
+                    state = json.loads(raw or "{}")
+                    repo = (state.get("settings") or {}).get("repository") or {}
+                    chat_id = str(repo.get("chatId") or "").strip()
+                    if chat_id:
+                        return chat_id
+                except Exception:
+                    continue
+            await cur.execute("SELECT chat_id FROM repositories WHERE status <> 'deleted' ORDER BY updated_at DESC LIMIT 1")
+            row = await cur.fetchone()
+            return str(row[0]).strip() if row and row[0] else ""
+    finally:
+        conn.close()
+
+
+async def source_repository_status():
+    try:
+        conn = await source_mysql_connect()
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT COUNT(*) FROM folders WHERE status <> 'deleted'")
+                folder_row = await cur.fetchone()
+                await cur.execute("SELECT COUNT(*) FROM resources WHERE status <> 'deleted'")
+                resource_row = await cur.fetchone()
+                repo_id = await detect_source_repository()
+                if repo_id:
+                    await cur.execute("SELECT COUNT(*) FROM resources WHERE status <> 'deleted' AND chat_id=%s", (repo_id,))
+                    selected_row = await cur.fetchone()
+                else:
+                    selected_row = (0,)
+            return {
+                "ok": True,
+                "folders": int(folder_row[0] or 0),
+                "resources_all": int(resource_row[0] or 0),
+                "resources_selected": int(selected_row[0] or 0),
+                "repo_id": repo_id,
+            }
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)[:240]}
+
+
+async def sync_source_repository():
+    repo_id = await detect_source_repository()
+    if not repo_id:
+        raise RuntimeError("已连接 MySQL，但没能自动识别仓库频道 ID。请点击「手动绑定」后发送频道 ID（通常以 -100 开头）。")
+    conn = await source_mysql_connect()
+    try:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT id, name, data FROM folders WHERE status <> 'deleted' ORDER BY sort_order, name")
+            folder_rows = await cur.fetchall()
+            await cur.execute(
+                "SELECT resource_key, folder_id, chat_id, message_id, title, file_type, data FROM resources WHERE status <> 'deleted' AND chat_id=%s ORDER BY message_id",
+                (repo_id,),
+            )
+            resource_rows = await cur.fetchall()
+    finally:
+        conn.close()
+
+    counts = {}
+    for row in resource_rows:
+        folder_id = str(row[1] or "")
+        item_type = str(row[5] or "").lower()
+        stat = counts.setdefault(folder_id, {"all": 0, "image": 0, "video": 0, "file": 0})
+        stat["all"] += 1
+        if "photo" in item_type or "image" in item_type:
+            stat["image"] += 1
+        elif "video" in item_type or "animation" in item_type:
+            stat["video"] += 1
+        else:
+            stat["file"] += 1
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM source_resources")
+        await db.execute("DELETE FROM source_folders")
+        folder_map = {}
+        for fid, name, raw in folder_rows:
+            fid = str(fid)
+            st = counts.get(fid, {"all": 0, "image": 0, "video": 0, "file": 0})
+            await db.execute(
+                "INSERT INTO source_folders (source_folder_id, name, item_count, image_count, video_count, file_count) VALUES (?, ?, ?, ?, ?, ?)",
+                (fid, str(name or "未命名文件夹"), st["all"], st["image"], st["video"], st["file"]),
+            )
+            folder_map[fid] = True
+        for key, folder_id, chat_id, message_id, title, file_type, raw in resource_rows:
+            await db.execute(
+                "INSERT OR REPLACE INTO source_resources (resource_key, folder_id, chat_id, message_id, title, file_type, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (str(key), str(folder_id or ""), str(chat_id), int(message_id or 0), str(title or ""), str(file_type or ""), str(raw or "{}")),
+            )
+        await db.commit()
+    await set_config("source_repo_id", repo_id)
+    return {"repo_id": repo_id, "folders": len(folder_rows), "resources": len(resource_rows)}
+
+
+async def source_repository_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 自动识别并绑定原仓库", callback_data="source_repo_auto")],
+        [InlineKeyboardButton(text="✍️ 手动绑定频道 ID", callback_data="source_repo_manual")],
+        [InlineKeyboardButton(text="🔄 同步文件夹与文件", callback_data="source_repo_sync")],
+        [InlineKeyboardButton(text="📊 查看连接状态", callback_data="source_repo_status")],
+        [InlineKeyboardButton(text="📁 浏览已同步文件夹", callback_data="source_repo_browse")],
+        [InlineKeyboardButton(text="↩️ 返回设置中心", callback_data="settings_home")],
+    ])
 
 
 async def get_or_create_user(user_id: int, username: str):
@@ -209,6 +400,8 @@ async def settings_center(message: Message):
         [InlineKeyboardButton(text="✏️ 修改欢迎文案", callback_data="settings_text:welcome_text"), InlineKeyboardButton(text="💡 修改帮助文案", callback_data="settings_text:help_text")],
         [InlineKeyboardButton(text="🖼️ 设置欢迎图片", callback_data="settings_welcome_image")],
         [InlineKeyboardButton(text="🎟️ 兑换码管理", callback_data="codes_manage")],
+        [InlineKeyboardButton(text="📚 资源仓库管理", callback_data="source_repo_manage")],
+        [InlineKeyboardButton(text="📚 资源仓库管理", callback_data="source_repo_manage")],
         [InlineKeyboardButton(text="📋 查看当前设置", callback_data="settings_show")],
     ])
     await message.answer("⚙️ 悦己设置中心\n━━━━━━━━━━━━━━\n请选择要调整的项目。大部分设置可直接点击完成。", reply_markup=kb)
@@ -230,6 +423,167 @@ async def settings_home_callback(callback: CallbackQuery):
         [InlineKeyboardButton(text="📋 查看当前设置", callback_data="settings_show")],
     ])
     await callback.message.edit_text("⚙️ 悦己设置中心\n━━━━━━━━━━━━━━\n请选择要调整的项目。", reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "source_repo_manage")
+async def source_repo_manage(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    repo_id = str(await get_config("source_repo_id", "") or "").strip()
+    state = await source_repository_status()
+    if state["ok"]:
+        status_text = (
+            "🟢 MySQL 可连接\n"
+            f"📁 原库文件夹：{state['folders']} 个\n"
+            f"📚 原库资源记录：{state['resources_all']} 条\n"
+            f"🔗 当前绑定频道：{repo_id or state['repo_id'] or '尚未绑定'}\n"
+            f"📦 该频道资源：{state['resources_selected']} 条"
+        )
+    else:
+        status_text = "🔴 MySQL 暂不可连接\n" + state["error"]
+    await callback.message.edit_text(
+        "📚 资源仓库管理\n━━━━━━━━━━━━━━\n"
+        + status_text
+        + "\n\n此功能只读取原资源库的文件夹和消息索引，不会修改或重启原机器人。"
+        + "\n请先绑定，再同步文件夹与文件。",
+        reply_markup=await source_repository_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "source_repo_auto")
+async def source_repo_auto(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    try:
+        repo_id = await detect_source_repository()
+        if not repo_id:
+            await callback.message.answer("没有自动识别到仓库频道，请点击「手动绑定频道 ID」。")
+        else:
+            await set_config("source_repo_id", repo_id)
+            await callback.message.answer(f"✅ 已识别并绑定原仓库频道：{repo_id}\n接下来点击「同步文件夹与文件」。")
+    except Exception as exc:
+        await callback.message.answer("❌ 连接原资源库失败：\n" + str(exc)[:700])
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "source_repo_manual")
+async def source_repo_manual(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    pending_config[callback.from_user.id] = "source_repo_id"
+    await callback.message.answer("✍️ 请发送原资源仓库的频道 ID（例如 -100 开头的数字）。\n发送「取消设置」可取消。")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "source_repo_sync")
+async def source_repo_sync(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    await callback.answer("正在同步，请稍候…")
+    try:
+        result = await sync_source_repository()
+        await callback.message.answer(
+            "✅ 原资源索引同步完成\n━━━━━━━━━━━━━━\n"
+            f"📁 文件夹：{result['folders']} 个\n"
+            f"📚 文件/消息记录：{result['resources']} 条\n"
+            f"🔗 绑定频道：{result['repo_id']}\n\n"
+            "本次仅同步索引，不移动或删除原仓库文件。"
+        )
+    except Exception as exc:
+        await callback.message.answer("❌ 同步失败：\n" + str(exc)[:900])
+        
+
+@dp.callback_query(F.data == "source_repo_status")
+async def source_repo_status(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    state = await source_repository_status()
+    if state["ok"]:
+        body = (
+            "🟢 MySQL 连接正常\n"
+            f"📁 文件夹总数：{state['folders']}\n"
+            f"📚 原库资源总数：{state['resources_all']}\n"
+            f"🔗 绑定频道：{await get_config('source_repo_id', '') or state['repo_id'] or '未绑定'}\n"
+            f"📦 频道资源记录：{state['resources_selected']}"
+        )
+    else:
+        body = "🔴 连接失败\n" + state["error"]
+    await callback.message.answer(body)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "source_repo_browse")
+async def source_repo_browse(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, name, item_count, image_count, video_count, file_count FROM source_folders ORDER BY name LIMIT 30"
+        ) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await callback.message.answer("目前没有已同步的文件夹。请先点击「同步文件夹与文件」。")
+    else:
+        buttons = []
+        for fid, name, total, images, videos, files in rows:
+            label = str(name)[:36]
+            buttons.append([InlineKeyboardButton(
+                text=f"📁 {label}（{total}）",
+                callback_data=f"source_folder:{fid}"
+            )])
+        buttons.append([InlineKeyboardButton(text="↩️ 返回资源仓库管理", callback_data="source_repo_manage")])
+        await callback.message.answer("📁 已同步文件夹（最多显示 30 个）\n点击文件夹查看记录：", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("source_folder:"))
+async def source_folder_detail(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    try:
+        fid = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer("文件夹编号无效", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT source_folder_id, name, item_count, image_count, video_count, file_count FROM source_folders WHERE id=?",
+            (fid,),
+        ) as cur:
+            folder = await cur.fetchone()
+        if folder:
+            async with db.execute(
+                "SELECT title, chat_id, message_id, file_type FROM source_resources WHERE folder_id=? ORDER BY message_id LIMIT 10",
+                (folder[0],),
+            ) as cur:
+                items = await cur.fetchall()
+    if not folder:
+        await callback.answer("文件夹不存在，请重新同步", show_alert=True)
+        return
+    source_id, name, total, images, videos, files = folder
+    text = (
+        f"📁 {name}\n━━━━━━━━━━━━━━\n"
+        f"🎬 视频/动画：{videos}\n🖼️ 图片：{images}\n📄 其他文件：{files}\n"
+        f"📦 资源记录：{total}\n\n"
+        "前 10 条资源索引：\n"
+    )
+    if items:
+        text += "\n".join(f"• {str(title or '未命名')[:90]}（消息 {mid}）" for title, chat, mid, typ in items)
+    else:
+        text += "这个文件夹目前没有匹配到该仓库频道的资源记录。"
+    await callback.message.answer(text[:4000], reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📁 返回文件夹列表", callback_data="source_repo_browse")],
+        [InlineKeyboardButton(text="📚 返回资源仓库管理", callback_data="source_repo_manage")],
+    ]))
     await callback.answer()
 
 
@@ -738,6 +1092,15 @@ async def handle_pending_admin_text(message: Message):
     if message.text == "取消设置":
         pending_config.pop(user_id, None)
         await message.answer("已取消本次设置。")
+        return
+    if key == "source_repo_id":
+        repo_id = (message.text or "").strip()
+        if not repo_id.lstrip("-").isdigit() or len(repo_id) < 5:
+            await message.answer("频道 ID 格式不正确，请发送数字频道 ID（通常以 -100 开头），或发送「取消设置」。")
+            return
+        await set_config("source_repo_id", repo_id)
+        pending_config.pop(user_id, None)
+        await message.answer(f"✅ 已保存原仓库频道 ID：{repo_id}\n请到「📚 资源仓库管理」点击「同步文件夹与文件」。")
         return
     if key not in ("welcome_text", "help_text"):
         return
