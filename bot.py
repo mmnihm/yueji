@@ -61,6 +61,7 @@ DEFAULT_CONFIG = {
     "menu_show_random": "1",
     "menu_show_buy": "1",
     "menu_show_help": "1",
+    "menu_order": "my_info,checkin,random,buy,help",
     "announcement_text": "",
     "support_url": "",
 }
@@ -241,6 +242,12 @@ async def validate_config_value(key: str, value: str):
         if value not in ("0", "1"):
             return None, "菜单显示状态无效。"
         return value, None
+    if key == "menu_order":
+        expected = {"my_info", "checkin", "random", "buy", "help"}
+        order = [part.strip() for part in value.split(",") if part.strip()]
+        if len(order) != len(expected) or set(order) != expected:
+            return None, "菜单顺序格式无效。"
+        return ",".join(order), None
     if key == "announcement_text":
         if len(value) > 1000:
             return None, "公告最多 1000 个字符。"
@@ -880,13 +887,17 @@ dp.callback_query.outer_middleware(UserAccessMiddleware())
 
 
 async def main_keyboard(user_id: int = 0):
-    menu_items = [
-        ("menu_show_my_info", "menu_my_info_text"),
-        ("menu_show_checkin", "menu_checkin_text"),
-        ("menu_show_random", "menu_random_text"),
-        ("menu_show_buy", "menu_buy_text"),
-        ("menu_show_help", "menu_help_text"),
-    ]
+    definitions = {
+        "my_info": ("menu_show_my_info", "menu_my_info_text"),
+        "checkin": ("menu_show_checkin", "menu_checkin_text"),
+        "random": ("menu_show_random", "menu_random_text"),
+        "buy": ("menu_show_buy", "menu_buy_text"),
+        "help": ("menu_show_help", "menu_help_text"),
+    }
+    raw_order = await get_config("menu_order", DEFAULT_CONFIG["menu_order"])
+    order = [part.strip() for part in str(raw_order).split(",") if part.strip() in definitions]
+    order.extend(key for key in definitions if key not in order)
+    menu_items = [definitions[key] for key in order]
     visible = []
     for show_key, text_key in menu_items:
         if await get_config(show_key, "1") == "1":
@@ -1413,9 +1424,20 @@ async def settings_buy_options(callback: CallbackQuery):
         [InlineKeyboardButton(text="10 / 30 / 50 / 100", callback_data="cfgset:buy_options:10,30,50,100")],
         [InlineKeyboardButton(text="5 / 15 / 30 / 60 / 100", callback_data="cfgset:buy_options:5,15,30,60,100")],
         [InlineKeyboardButton(text="20 / 50 / 100 / 200", callback_data="cfgset:buy_options:20,50,100,200")],
+        [InlineKeyboardButton(text="✏️ 自定义积分档位", callback_data="settings_buy_options_custom")],
         [InlineKeyboardButton(text="↩️ 返回设置", callback_data="settings_home")],
     ])
     await callback.message.edit_text("🛍️ 请选择积分购买档位。提示：当前购买按钮仅为档位展示，真实支付尚未接入。", reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settings_buy_options_custom")
+async def settings_buy_options_custom(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    pending_config[callback.from_user.id] = "buy_options"
+    await callback.message.answer("请发送积分档位列表，例如：10,30,50,100。最多 10 档，数值 1–100000 且不能重复。发送「取消设置」可退出。")
     await callback.answer()
 
 
@@ -1478,21 +1500,26 @@ async def settings_menu_manage(callback: CallbackQuery, answer_callback: bool = 
         await callback.answer("无权限", show_alert=True)
         return
     items = [
-        ("menu_my_info_text", "menu_show_my_info", "我的信息"),
-        ("menu_checkin_text", "menu_show_checkin", "每日签到"),
-        ("menu_random_text", "menu_show_random", "随机资源"),
-        ("menu_buy_text", "menu_show_buy", "购买积分"),
-        ("menu_help_text", "menu_show_help", "用户帮助"),
+        ("my_info", "menu_my_info_text", "menu_show_my_info", "我的信息"),
+        ("checkin", "menu_checkin_text", "menu_show_checkin", "每日签到"),
+        ("random", "menu_random_text", "menu_show_random", "随机资源"),
+        ("buy", "menu_buy_text", "menu_show_buy", "购买积分"),
+        ("help", "menu_help_text", "menu_show_help", "用户帮助"),
     ]
-    lines = ["🧩 用户菜单管理", "━━━━━━━━━━━━━━"]
+    order = [part.strip() for part in (await get_config("menu_order", DEFAULT_CONFIG["menu_order"])).split(",")]
+    lines = ["🧩 用户菜单管理", "━━━━━━━━━━━━━━", "菜单显示顺序：" + " → ".join(order)]
     buttons = []
-    for text_key, show_key, title in items:
+    for item_key, text_key, show_key, title in items:
         label = await get_config(text_key, DEFAULT_CONFIG[text_key])
         visible = await get_config(show_key, "1") == "1"
         lines.append(f"{'🟢 显示' if visible else '⚪️ 隐藏'}｜{title}：{label}")
         buttons.append([
             InlineKeyboardButton(text=f"✏️ 改名：{title}", callback_data=f"settings_menu_label:{text_key}"),
             InlineKeyboardButton(text=("隐藏" if visible else "显示") + f"：{title}", callback_data=f"menu_toggle:{show_key}:{'0' if visible else '1'}"),
+        ])
+        buttons.append([
+            InlineKeyboardButton(text=f"⬆️ {title}", callback_data=f"menu_move:{item_key}:up"),
+            InlineKeyboardButton(text=f"⬇️ {title}", callback_data=f"menu_move:{item_key}:down"),
         ])
     buttons.append([InlineKeyboardButton(text="↩️ 返回设置中心", callback_data="settings_home")])
     await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
@@ -1512,6 +1539,32 @@ async def settings_menu_label(callback: CallbackQuery):
     pending_config[callback.from_user.id] = key
     await callback.message.answer("请发送新的菜单按钮名称（最多 32 个字符，不能与其他菜单重名）。发送「取消设置」可退出。")
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("menu_move:"))
+async def settings_menu_move(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    try:
+        _, item_key, direction = callback.data.split(":", 2)
+    except ValueError:
+        await callback.answer("菜单排序参数无效", show_alert=True)
+        return
+    allowed = ["my_info", "checkin", "random", "buy", "help"]
+    if item_key not in allowed or direction not in ("up", "down"):
+        await callback.answer("菜单排序参数无效", show_alert=True)
+        return
+    order = [part.strip() for part in (await get_config("menu_order", DEFAULT_CONFIG["menu_order"])).split(",")]
+    index = order.index(item_key)
+    target = index - 1 if direction == "up" else index + 1
+    if target < 0 or target >= len(order):
+        await callback.answer("已经到达边界", show_alert=True)
+        return
+    order[index], order[target] = order[target], order[index]
+    await set_config("menu_order", ",".join(order))
+    await callback.answer("菜单顺序已保存")
+    await settings_menu_manage(callback, answer_callback=False)
 
 
 @dp.callback_query(F.data.startswith("menu_toggle:"))
@@ -1914,6 +1967,9 @@ async def buy_points(message: Message):
 @dp.message(F.text == "帮助")
 async def help_cmd(message: Message):
     help_text = await get_config("help_text")
+    support_url = await get_config("support_url", "")
+    if support_url:
+        help_text = (help_text or "") + "\n\n🆘 客服：" + support_url
     await message.answer(help_text)
 
 
@@ -2123,6 +2179,15 @@ async def handle_pending_admin_text(message: Message):
         buttons.append([InlineKeyboardButton(text="🔍 重新搜索", callback_data="admin_user_search")])
         buttons.append([InlineKeyboardButton(text="📋 最近用户", callback_data="admin_users_clear_search")])
         await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        return
+    if key == "buy_options":
+        normalized, error = await validate_config_value("buy_options", message.text or "")
+        if error:
+            await message.answer(error + "\n请重新发送档位列表，或发送「取消设置」。")
+            return
+        await set_config("buy_options", normalized)
+        pending_config.pop(user_id, None)
+        await message.answer("✅ 积分档位已保存：" + normalized)
         return
     if key in ("browse_minutes", "daily_unlock_limit"):
         normalized, error = await validate_config_value(key, message.text or "")
