@@ -25,6 +25,7 @@ class YuejiBotSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await app.get_config("random_count"), "3")
         self.assertEqual(await app.get_config("daily_unlock_limit"), "0")
         self.assertEqual(await app.get_config("menu_show_random"), "1")
+        self.assertEqual(await app.get_config("menu_order"), "my_info,checkin,random,buy,help")
         self.assertEqual(await app.get_config("announcement_text"), "")
 
     async def test_config_validation_limits(self):
@@ -53,6 +54,14 @@ class YuejiBotSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(error)
 
         value, error = await app.validate_config_value("menu_my_info_text", "🎁 每日签到")
+        self.assertIsNone(value)
+        self.assertIsNotNone(error)
+
+        value, error = await app.validate_config_value("menu_order", "random,my_info,checkin,buy,help")
+        self.assertEqual(value, "random,my_info,checkin,buy,help")
+        self.assertIsNone(error)
+
+        value, error = await app.validate_config_value("menu_order", "random,random,help")
         self.assertIsNone(value)
         self.assertIsNotNone(error)
 
