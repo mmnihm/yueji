@@ -1148,36 +1148,78 @@ async def codes_generate(callback: CallbackQuery):
     await callback.message.edit_reply_markup(reply_markup=None)
 
 
+@dp.callback_query(F.data == "admin_user_search")
+async def admin_user_search(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    pending_config[callback.from_user.id] = "admin_user_search"
+    await callback.message.answer("🔍 请发送用户的 Telegram 数字 ID 或用户名（可带 @）。发送「取消设置」可退出。")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_users_clear_search")
+async def admin_users_clear_search(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    admin_user_search_queries.pop(callback.from_user.id, None)
+    await admin_users(callback, answer_callback=False)
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "admin_users")
 async def admin_users(callback: CallbackQuery, answer_callback: bool = True):
     if not is_admin(callback.from_user.id):
         await callback.answer("无权限", show_alert=True)
         return
+    query = admin_user_search_queries.get(callback.from_user.id, "").strip().lstrip("@")
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT user_id, username, points FROM users ORDER BY rowid DESC LIMIT 10"
-        ) as cur:
-            rows = await cur.fetchall()
-        async with db.execute("SELECT COUNT(*) FROM users") as cur:
-            count_row = await cur.fetchone()
+        if query:
+            async with db.execute(
+                """SELECT user_id, username, points, banned FROM users
+                   WHERE CAST(user_id AS TEXT)=? OR username LIKE ?
+                   ORDER BY rowid DESC LIMIT 10""",
+                (query, f"%{query}%"),
+            ) as cur:
+                rows = await cur.fetchall()
+            async with db.execute(
+                """SELECT COUNT(*) FROM users
+                   WHERE CAST(user_id AS TEXT)=? OR username LIKE ?""",
+                (query, f"%{query}%"),
+            ) as cur:
+                count_row = await cur.fetchone()
+        else:
+            async with db.execute(
+                "SELECT user_id, username, points, banned FROM users ORDER BY rowid DESC LIMIT 10"
+            ) as cur:
+                rows = await cur.fetchall()
+            async with db.execute("SELECT COUNT(*) FROM users") as cur:
+                count_row = await cur.fetchone()
+    title = "🔍 用户搜索结果" if query else "👥 用户与积分管理"
     lines = [
-        "👥 用户与积分管理",
+        title,
         "━━━━━━━━━━━━━━",
-        f"👤 用户总数：{int(count_row[0] or 0)}",
-        "显示最近注册/创建的 10 位用户，可直接增减积分。",
+        f"👤 用户总数：{int(count_row[0] or 0)}" + (f"（搜索：{query}）" if query else ""),
+        "显示最多 10 位用户，可增减积分或封禁/解封。",
         "",
     ]
     buttons = []
-    for uid, username, points in rows:
+    for uid, username, points, banned in rows:
         label = (("@" + username) if username else str(uid))[:24]
-        lines.append(f"• {label}（ID {uid}）：{int(points or 0)} 积分")
+        lines.append(f"• {label}（ID {uid}）：{int(points or 0)} 积分｜{'🚫 已封禁' if banned else '🟢 正常'}")
         buttons.append([
-            InlineKeyboardButton(text=f"➕10", callback_data=f"admin_points:{uid}:10"),
-            InlineKeyboardButton(text=f"➕50", callback_data=f"admin_points:{uid}:50"),
-            InlineKeyboardButton(text=f"➖10", callback_data=f"admin_points:{uid}:-10"),
-            InlineKeyboardButton(text=f"➖50", callback_data=f"admin_points:{uid}:-50"),
+            InlineKeyboardButton(text="➕10", callback_data=f"admin_points:{uid}:10"),
+            InlineKeyboardButton(text="➕50", callback_data=f"admin_points:{uid}:50"),
+            InlineKeyboardButton(text="➖10", callback_data=f"admin_points:{uid}:-10"),
+            InlineKeyboardButton(text=("🔓 解封" if banned else "🚫 封禁"), callback_data=f"admin_ban:{uid}:{0 if banned else 1}"),
         ])
-    buttons.append([InlineKeyboardButton(text="🔄 刷新用户列表", callback_data="admin_users")])
+    if not rows:
+        lines.append("没有找到匹配用户。")
+    buttons.append([InlineKeyboardButton(text="🔍 搜索用户", callback_data="admin_user_search")])
+    if query:
+        buttons.append([InlineKeyboardButton(text="📋 返回最近用户", callback_data="admin_users_clear_search")])
+    buttons.append([InlineKeyboardButton(text="🔄 刷新", callback_data="admin_users")])
     buttons.append([InlineKeyboardButton(text="↩️ 返回设置中心", callback_data="settings_home")])
     await callback.message.edit_text(
         "\n".join(lines),
@@ -1185,6 +1227,35 @@ async def admin_users(callback: CallbackQuery, answer_callback: bool = True):
     )
     if answer_callback:
         await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_ban:"))
+async def admin_ban_user(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    try:
+        _, uid_text, banned_text = callback.data.split(":")
+        target_id, banned = int(uid_text), int(banned_text)
+    except (ValueError, TypeError):
+        await callback.answer("用户参数无效", show_alert=True)
+        return
+    if banned not in (0, 1):
+        await callback.answer("封禁参数无效", show_alert=True)
+        return
+    if target_id == ADMIN_ID:
+        await callback.answer("不能封禁机器人管理员。", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM users WHERE user_id=?", (target_id,)) as cur:
+            exists = await cur.fetchone()
+        if not exists:
+            await callback.answer("用户不存在", show_alert=True)
+            return
+        await db.execute("UPDATE users SET banned=? WHERE user_id=?", (banned, target_id))
+        await db.commit()
+    await callback.answer("已封禁用户" if banned else "已解除封禁")
+    await admin_users(callback, answer_callback=False)
 
 
 @dp.callback_query(F.data.startswith("admin_points:"))
