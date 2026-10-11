@@ -395,7 +395,11 @@ async def send_source_folder_card(message: Message, folder):
         try:
             await send_source_messages(message.chat.id, preview_rows, preview=True)
         except Exception as exc:
-            await message.answer("⚠️ 预览发送失败。请管理员检查悦己机器人是否已加入原仓库并有读取权限。")
+            try:
+                await message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await message.answer("⚠️ 预览发送失败，暂时无法解锁这个文件夹。请管理员检查悦己机器人是否已加入原仓库并有读取权限。")
             print("Source preview error:", str(exc)[:300])
 
 
@@ -572,7 +576,6 @@ async def settings_center(message: Message):
         [InlineKeyboardButton(text="📅 每日签到奖励", callback_data="settings_checkin")],
         [InlineKeyboardButton(text="🛍️ 积分购买档位", callback_data="settings_buy_options")],
         [InlineKeyboardButton(text="🎲 随机资源数量", callback_data="settings_random_count")],
-        [InlineKeyboardButton(text="📦 文件夹解锁价格", callback_data="settings_source_price")],
         [InlineKeyboardButton(text="📦 文件夹解锁价格", callback_data="settings_source_price")],
         [InlineKeyboardButton(text="✏️ 修改欢迎文案", callback_data="settings_text:welcome_text"), InlineKeyboardButton(text="💡 修改帮助文案", callback_data="settings_text:help_text")],
         [InlineKeyboardButton(text="🖼️ 设置欢迎图片", callback_data="settings_welcome_image")],
