@@ -4,12 +4,13 @@ import random
 import secrets
 import json
 from datetime import date
+from datetime import datetime
 from urllib.parse import urlparse, unquote
 
 import aiomysql
 
 import aiosqlite
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
     Message,
@@ -46,6 +47,23 @@ DEFAULT_CONFIG = {
     "welcome_image_file_id": "",
     "source_repo_id": "",
     "source_folder_price": "10",
+    "browse_minutes": "5",
+    "browse_scope": "all",
+    "browse_admin_exempt": "1",
+    "daily_unlock_limit": "0",
+    "menu_my_info_text": "👤 我的信息",
+    "menu_checkin_text": "🎁 每日签到",
+    "menu_random_text": "🎲 随机资源",
+    "menu_buy_text": "🛍️ 购买积分",
+    "menu_help_text": "💡 用户帮助",
+    "menu_show_my_info": "1",
+    "menu_show_checkin": "1",
+    "menu_show_random": "1",
+    "menu_show_buy": "1",
+    "menu_show_help": "1",
+    "menu_order": "my_info,checkin,random,buy,help",
+    "announcement_text": "",
+    "support_url": "",
 }
 
 
@@ -57,9 +75,14 @@ async def init_db():
                 username TEXT,
                 points INTEGER DEFAULT 10,
                 total_spent INTEGER DEFAULT 0,
-                unlocked_count INTEGER DEFAULT 0
+                unlocked_count INTEGER DEFAULT 0,
+                banned INTEGER NOT NULL DEFAULT 0
             )
         """)
+        async with db.execute("PRAGMA table_info(users)") as cur:
+            user_columns = {row[1] for row in await cur.fetchall()}
+        if "banned" not in user_columns:
+            await db.execute("ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS resources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -143,6 +166,15 @@ async def init_db():
                 PRIMARY KEY (user_id, source_folder_id)
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS source_browse_sessions (
+                user_id INTEGER NOT NULL,
+                source_folder_id TEXT NOT NULL,
+                started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                expires_at TEXT,
+                PRIMARY KEY (user_id, source_folder_id)
+            )
+        """)
         await db.commit()
 
 
@@ -159,6 +191,94 @@ async def set_config(key: str, value: str):
             "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, value)
         )
         await db.commit()
+
+
+async def validate_config_value(key: str, value: str):
+    value = str(value).strip()
+    numeric_ranges = {
+        "start_points": (0, 1000000),
+        "source_folder_price": (0, 1000000),
+        "random_count": (1, 10),
+        "browse_minutes": (0, 1440),
+        "daily_unlock_limit": (0, 1000),
+        "checkin_min": (0, 100000),
+        "checkin_max": (0, 100000),
+    }
+    if key == "buy_options":
+        options = [part.strip() for part in value.split(",")]
+        if (not options or len(options) > 10
+                or any(not part.isdigit() or not 1 <= int(part) <= 100000 for part in options)
+                or len(set(options)) != len(options)):
+            return None, "积分档位须为 1–100000 的正整数，最多 10 档且不能重复。"
+        return ",".join(options), None
+    if key in numeric_ranges:
+        if not value.isdigit():
+            return None, "该设置必须填写数字。"
+        number = int(value)
+        low, high = numeric_ranges[key]
+        if not low <= number <= high:
+            return None, f"数值范围应为 {low}–{high}。"
+        if key == "checkin_min":
+            high_value = int(await get_config("checkin_max", "3") or 0)
+            if number > high_value:
+                return None, "签到最低奖励不能高于当前最高奖励。"
+        if key == "checkin_max":
+            low_value = int(await get_config("checkin_min", "1") or 0)
+            if number < low_value:
+                return None, "签到最高奖励不能低于当前最低奖励。"
+        return str(number), None
+    menu_label_keys = {
+        "menu_my_info_text", "menu_checkin_text", "menu_random_text",
+        "menu_buy_text", "menu_help_text",
+    }
+    if key in menu_label_keys:
+        if not value or len(value) > 32 or "\n" in value:
+            return None, "菜单名称不能为空，最多 32 个字符且不能换行。"
+        for other_key in menu_label_keys:
+            if other_key != key and value == await get_config(other_key, DEFAULT_CONFIG[other_key]):
+                return None, "菜单名称不能与其他菜单重复。"
+        return value, None
+    if key in ("menu_show_my_info", "menu_show_checkin", "menu_show_random", "menu_show_buy", "menu_show_help"):
+        if value not in ("0", "1"):
+            return None, "菜单显示状态无效。"
+        return value, None
+    if key == "menu_order":
+        expected = {"my_info", "checkin", "random", "buy", "help"}
+        order = [part.strip() for part in value.split(",") if part.strip()]
+        if len(order) != len(expected) or set(order) != expected:
+            return None, "菜单顺序格式无效。"
+        return ",".join(order), None
+    if key == "announcement_text":
+        if len(value) > 1000:
+            return None, "公告最多 1000 个字符。"
+        return value, None
+    if key == "support_url":
+        if len(value) > 500:
+            return None, "客服链接不能超过 500 个字符。"
+        if value and (not value.startswith(("https://", "http://")) or not urlparse(value).netloc):
+            return None, "客服链接请填写完整的 http:// 或 https:// URL。"
+        return value, None
+    if key == "browse_scope":
+        if value not in ("all", "videos"):
+            return None, "浏览范围只能设置为全部资源或视频。"
+        return value, None
+    if key == "browse_admin_exempt":
+        if value not in ("0", "1"):
+            return None, "管理员限时选项无效。"
+        return value, None
+    if key == "source_repo_id":
+        if not value.lstrip("-").isdigit() or len(value) < 5:
+            return None, "频道 ID 格式不正确，请发送数字频道 ID。"
+        return value, None
+    if key in ("welcome_text", "help_text"):
+        if not value or len(value) > 3500:
+            return None, "文案不能为空，且请控制在 3500 字以内。"
+        return value, None
+    if key == "welcome_image_file_id":
+        return None, "请通过欢迎图片按钮发送图片，不支持手动输入此配置。"
+    if key not in DEFAULT_CONFIG:
+        return None, "无效配置键。"
+    return value, None
 
 
 def source_mysql_settings():
@@ -374,7 +494,8 @@ async def send_source_messages(chat_id: int, rows, preview: bool = False):
 async def send_source_folder_card(message: Message, folder):
     fid, name, total, images, videos, files = folder
     points, _, _ = await get_or_create_user(message.from_user.id, message.from_user.username or "")
-    price = int(await get_config("source_folder_price", "10") or 10)
+    price_value = await get_config("source_folder_price", "10")
+    price = max(0, int(price_value if price_value is not None else 10))
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT chat_id, message_id, file_type, file_id, data FROM source_resources WHERE folder_id=? ORDER BY message_id",
@@ -440,10 +561,18 @@ async def choose_random_source_folder(message: Message):
     if not folders:
         return False
 
-    for folder in folders:
+    # Respect the admin-configured random count. Clamp it defensively so a bad
+    # database value cannot cause an unexpectedly large burst of messages.
+    try:
+        requested = int(await get_config("random_count", "3") or 3)
+    except (TypeError, ValueError):
+        requested = 3
+    requested = max(1, min(requested, 10))
+    sent_cards = 0
+    for folder in folders[:requested]:
         if await send_source_folder_card(message, folder):
-            return True
-    return False
+            sent_cards += 1
+    return sent_cards > 0
 
 
 @dp.callback_query(F.data == "source_random_again")
@@ -451,6 +580,86 @@ async def source_random_again(callback: CallbackQuery):
     await callback.answer()
     if not await choose_random_source_folder(callback.message):
         await callback.message.answer("📭 暂时没有已同步的资源文件夹，请稍后再试。")
+
+
+async def create_browse_session(user_id: int, fid: str):
+    try:
+        minutes = max(0, min(1440, int(await get_config("browse_minutes", "5") or 0)))
+    except (TypeError, ValueError):
+        minutes = 5
+    admin_exempt = (await get_config("browse_admin_exempt", "1")) == "1" and is_admin(user_id)
+    expires_at = None
+    if minutes > 0 and not admin_exempt:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """INSERT INTO source_browse_sessions (user_id, source_folder_id, started_at, expires_at)
+                   VALUES (?, ?, datetime('now'), datetime('now', ?))
+                   ON CONFLICT(user_id, source_folder_id) DO NOTHING""",
+                (user_id, fid, f"+{minutes} minutes"),
+            )
+            await db.commit()
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """INSERT INTO source_browse_sessions (user_id, source_folder_id, started_at, expires_at)
+                   VALUES (?, ?, datetime('now'), NULL)
+                   ON CONFLICT(user_id, source_folder_id) DO NOTHING""",
+                (user_id, fid),
+            )
+            await db.commit()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT started_at, expires_at FROM source_browse_sessions WHERE user_id=? AND source_folder_id=?",
+            (user_id, fid),
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def browse_session_expired(user_id: int, fid: str):
+    try:
+        minutes = max(0, int(await get_config("browse_minutes", "5") or 0))
+    except (TypeError, ValueError):
+        minutes = 5
+    if minutes == 0 or ((await get_config("browse_admin_exempt", "1")) == "1" and is_admin(user_id)):
+        return False
+    session = await create_browse_session(user_id, fid)
+    if not session or not session[1]:
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT CASE WHEN datetime('now') >= ? THEN 1 ELSE 0 END",
+            (session[1],),
+        ) as cur:
+            row = await cur.fetchone()
+    return bool(row and row[0])
+
+
+def browse_start_keyboard(fid: str):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="▶️ 开始浏览资源", callback_data=f"source_browse_start:{fid}")
+    ]])
+
+
+async def send_browse_page_summary(message: Message, fid: str, rows, offset: int, sent: int, skipped_video_batch: bool = False):
+    total = len(rows)
+    next_offset = min(offset + 10, total)
+    remaining = max(0, total - next_offset)
+    if skipped_video_batch:
+        note = "⏱️ 浏览时限已结束，本批包含视频，已跳过该批。其他不含视频的批次仍可继续。"
+    else:
+        note = f"📦 本批已发送 {sent} 个资源。"
+    if remaining:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=f"📦 继续发送（剩余 {remaining} 个）",
+                callback_data=f"source_more:{fid}:{next_offset}",
+            )
+        ]])
+        await message.answer(f"{note}\n剩余 {remaining} 个，点击下方继续。", reply_markup=kb)
+    elif skipped_video_batch:
+        await message.answer(note + "\n本文件夹已没有其他批次。")
+    else:
+        await message.answer(f"✅ 该文件夹资源已发送完毕，本批发送 {sent} 个。")
 
 
 @dp.callback_query(F.data.startswith("source_unlock:"))
@@ -478,59 +687,117 @@ async def source_folder_unlock(callback: CallbackQuery):
             (user_id, fid),
         ) as cur:
             existing = await cur.fetchone()
-        if existing:
-            await db.rollback()
-            await callback.answer("你已解锁过这个文件夹，不会重复扣积分。", show_alert=True)
-            return
-        async with db.execute("SELECT points FROM users WHERE user_id=?", (user_id,)) as cur:
-            user_row = await cur.fetchone()
-        price = max(0, int(await get_config("source_folder_price", "10") or 10))
-        if not user_row or int(user_row[0]) < price:
-            await db.rollback()
-            await callback.answer(f"积分不足，需要 {price} 积分。", show_alert=True)
-            return
+        if not existing:
+            try:
+                daily_limit = max(0, int(await get_config("daily_unlock_limit", "0") or 0))
+            except (TypeError, ValueError):
+                daily_limit = 0
+            if daily_limit and not is_admin(user_id):
+                async with db.execute(
+                    "SELECT COUNT(*) FROM source_folder_unlocks WHERE user_id=? AND date(unlocked_at)=date('now')",
+                    (user_id,),
+                ) as cur:
+                    daily_row = await cur.fetchone()
+                used_today = int(daily_row[0] or 0) if daily_row else 0
+                if used_today >= daily_limit:
+                    await db.rollback()
+                    await callback.answer(f"今天已达到文件夹解锁上限（{daily_limit} 个），请明天再来。", show_alert=True)
+                    return
+            async with db.execute("SELECT points FROM users WHERE user_id=?", (user_id,)) as cur:
+                user_row = await cur.fetchone()
+            price_value = await get_config("source_folder_price", "10")
+            price = max(0, int(price_value if price_value is not None else 10))
+            if not user_row or int(user_row[0]) < price:
+                await db.rollback()
+                await callback.answer(f"积分不足，需要 {price} 积分。", show_alert=True)
+                return
+            async with db.execute(
+                "SELECT 1 FROM source_resources WHERE folder_id=? LIMIT 1",
+                (fid,),
+            ) as cur:
+                has_resources = await cur.fetchone()
+            if not has_resources:
+                await db.rollback()
+                await callback.answer("没有找到该文件夹的资源消息", show_alert=True)
+                return
+            await db.execute(
+                "UPDATE users SET points=points-?, total_spent=total_spent+?, unlocked_count=unlocked_count+1 WHERE user_id=?",
+                (price, price, user_id),
+            )
+            await db.execute(
+                "INSERT INTO source_folder_unlocks (user_id, source_folder_id) VALUES (?, ?)",
+                (user_id, fid),
+            )
+        await db.commit()
+    await callback.answer("已解锁" if not existing else "你已解锁过，不会重复扣积分")
+    await callback.message.edit_text(
+        f"🔓 文件夹「{folder[0]}」已解锁。\n\n点击「开始浏览资源」后开始计时；时间到后，机器人将停止发送受限资源。已发送的内容无法撤回。",
+        reply_markup=browse_start_keyboard(fid),
+    )
+
+
+@dp.callback_query(F.data.startswith("source_browse_start:"))
+async def source_browse_start(callback: CallbackQuery):
+    try:
+        fid = str(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.answer("文件夹参数无效", show_alert=True)
+        return
+    user_id = callback.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT chat_id, message_id FROM source_resources WHERE folder_id=? ORDER BY message_id",
+            "SELECT 1 FROM source_folder_unlocks WHERE user_id=? AND source_folder_id=?",
+            (user_id, fid),
+        ) as cur:
+            unlocked = await cur.fetchone()
+        async with db.execute(
+            "SELECT chat_id, message_id, file_type FROM source_resources WHERE folder_id=? ORDER BY message_id",
             (fid,),
         ) as cur:
             rows = await cur.fetchall()
-        if not rows:
-            await db.rollback()
-            await callback.answer("没有找到该文件夹的资源消息", show_alert=True)
-            return
-        await db.execute(
-            "UPDATE users SET points=points-?, total_spent=total_spent+?, unlocked_count=unlocked_count+1 WHERE user_id=?",
-            (price, price, user_id),
-        )
-        await db.execute(
-            "INSERT INTO source_folder_unlocks (user_id, source_folder_id) VALUES (?, ?)",
+    if not unlocked:
+        await callback.answer("请先解锁这个文件夹。", show_alert=True)
+        return
+    if not rows:
+        await callback.answer("该文件夹没有可发送的资源。", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM source_browse_sessions WHERE user_id=? AND source_folder_id=?",
             (user_id, fid),
-        )
-        await db.commit()
-    await callback.answer("解锁成功")
+        ) as cur:
+            existing_session = await cur.fetchone()
+    if existing_session:
+        if await browse_session_expired(user_id, fid):
+            await callback.answer("该文件夹的浏览时限已结束，不能重新开始计时。", show_alert=True)
+        else:
+            await callback.answer("浏览计时已经开始，请使用原有的「继续发送」按钮，避免重复发送。", show_alert=True)
+        return
+    session = await create_browse_session(user_id, fid)
+    if await browse_session_expired(user_id, fid):
+        await callback.answer("该文件夹的浏览时限已结束，不能重新开始计时。", show_alert=True)
+        return
     try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-    await callback.message.answer(f"🎉 已解锁「{folder[0]}」。本次先发送 10 个文件，剩余资源可点击按钮继续获取。")
-    first_page = rows[:10]
-    sent = await send_source_messages(callback.message.chat.id, first_page)
-    next_offset = len(first_page)
-    if next_offset < len(rows):
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text=f"📦 继续发送（剩余 {len(rows) - next_offset} 个）",
-                callback_data=f"source_more:{fid}:{next_offset}",
-            )
-        ]])
-        await callback.message.answer(
-            f"📦 本次已发送 {sent} 个，剩余 {len(rows) - next_offset} 个。\n需要的话点击下方继续，每次最多发送 10 个。",
-            reply_markup=kb,
-        )
+        minutes = max(0, int(await get_config("browse_minutes", "5") or 0))
+    except (TypeError, ValueError):
+        minutes = 5
+    admin_exempt = (await get_config("browse_admin_exempt", "1")) == "1" and is_admin(user_id)
+    if minutes == 0:
+        time_text = "本文件夹未设置浏览时限。"
+    elif admin_exempt:
+        time_text = "管理员账号不受浏览时限限制。"
+    elif session and session[1]:
+        time_text = f"本次浏览时限：{minutes} 分钟，从点击开始时计算。"
     else:
-        await callback.message.answer(f"📦 发送完成，本文件夹共发送 {sent} 个资源。")
-
-
+        time_text = "浏览计时已启动。"
+    await callback.answer("开始浏览")
+    try:
+        await callback.message.edit_text(f"▶️ 已开始浏览文件夹。\n{time_text}\n时间到后，已发送内容不会撤回。")
+    except Exception:
+        await callback.message.answer(f"▶️ 已开始浏览文件夹。\n{time_text}")
+    first_page = rows[:10]
+    sent = await send_source_messages(callback.message.chat.id, [(r[0], r[1]) for r in first_page])
+    await send_browse_page_summary(callback.message, fid, rows, 0, sent)
 
 
 @dp.callback_query(F.data.startswith("source_more:"))
@@ -549,36 +816,31 @@ async def source_folder_more(callback: CallbackQuery):
             (user_id, fid),
         ) as cur:
             unlocked = await cur.fetchone()
-        if not unlocked:
-            await callback.answer("请先解锁这个文件夹。", show_alert=True)
-            return
         async with db.execute(
-            "SELECT chat_id, message_id FROM source_resources WHERE folder_id=? ORDER BY message_id",
+            "SELECT chat_id, message_id, file_type FROM source_resources WHERE folder_id=? ORDER BY message_id",
             (fid,),
         ) as cur:
             rows = await cur.fetchall()
-
+    if not unlocked:
+        await callback.answer("请先解锁这个文件夹。", show_alert=True)
+        return
     if offset >= len(rows):
         await callback.answer("这个文件夹的资源已经发送完了。", show_alert=True)
         return
 
-    await callback.answer("正在发送下一批")
+    expired = await browse_session_expired(user_id, fid)
+    scope = await get_config("browse_scope", "all")
     page = rows[offset:offset + 10]
-    sent = await send_source_messages(callback.message.chat.id, page)
-    next_offset = offset + len(page)
-    if next_offset < len(rows):
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text=f"📦 继续发送（剩余 {len(rows) - next_offset} 个）",
-                callback_data=f"source_more:{fid}:{next_offset}",
-            )
-        ]])
-        await callback.message.answer(
-            f"📦 本次已发送 {sent} 个，剩余 {len(rows) - next_offset} 个。每次最多发送 10 个。",
-            reply_markup=kb,
-        )
-    else:
-        await callback.message.answer(f"✅ 该文件夹资源已发送完毕，本批发送 {sent} 个。")
+    has_video = any(any(kind in str(row[2] or "").lower() for kind in ("video", "animation")) for row in page)
+    if expired and scope != "videos":
+        await callback.answer("浏览时限已结束，无法继续发送该文件夹资源。", show_alert=True)
+        return
+    await callback.answer("正在发送下一批")
+    if expired and scope == "videos" and has_video:
+        await send_browse_page_summary(callback.message, fid, rows, offset, 0, skipped_video_batch=True)
+        return
+    sent = await send_source_messages(callback.message.chat.id, [(r[0], r[1]) for r in page])
+    await send_browse_page_summary(callback.message, fid, rows, offset, sent)
 
 
 async def get_or_create_user(user_id: int, username: str):
@@ -600,14 +862,51 @@ async def get_or_create_user(user_id: int, username: str):
 
 
 def is_admin(user_id: int) -> bool:
-    return ADMIN_ID and user_id == ADMIN_ID
+    return bool(ADMIN_ID and user_id == ADMIN_ID)
 
 
-def main_keyboard(user_id: int = 0):
-    rows = [
-        [KeyboardButton(text="👤 我的信息"), KeyboardButton(text="🎁 每日签到"), KeyboardButton(text="🎲 随机资源")],
-        [KeyboardButton(text="🛍️ 购买积分"), KeyboardButton(text="💡 用户帮助")],
-    ]
+class UserAccessMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if not user or is_admin(user.id):
+            return await handler(event, data)
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT banned FROM users WHERE user_id=?", (user.id,)) as cur:
+                row = await cur.fetchone()
+        if row and int(row[0] or 0):
+            if isinstance(event, CallbackQuery):
+                await event.answer("你的账号当前无法使用该机器人，请联系管理员。", show_alert=True)
+            elif isinstance(event, Message):
+                await event.answer("你的账号当前无法使用该机器人，请联系管理员。")
+            return None
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(UserAccessMiddleware())
+dp.callback_query.outer_middleware(UserAccessMiddleware())
+
+
+async def main_keyboard(user_id: int = 0):
+    definitions = {
+        "my_info": ("menu_show_my_info", "menu_my_info_text"),
+        "checkin": ("menu_show_checkin", "menu_checkin_text"),
+        "random": ("menu_show_random", "menu_random_text"),
+        "buy": ("menu_show_buy", "menu_buy_text"),
+        "help": ("menu_show_help", "menu_help_text"),
+    }
+    raw_order = await get_config("menu_order", DEFAULT_CONFIG["menu_order"])
+    order = [part.strip() for part in str(raw_order).split(",") if part.strip() in definitions]
+    order.extend(key for key in definitions if key not in order)
+    menu_items = [definitions[key] for key in order]
+    visible = []
+    for show_key, text_key in menu_items:
+        if await get_config(show_key, "1") == "1":
+            visible.append(KeyboardButton(text=await get_config(text_key, DEFAULT_CONFIG[text_key])))
+    rows = []
+    if visible:
+        rows.append(visible[:3])
+    if len(visible) > 3:
+        rows.append(visible[3:])
     if is_admin(user_id):
         rows.append([KeyboardButton(text="⚙️ 设置中心")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
@@ -618,14 +917,21 @@ async def cmd_start(message: Message):
     await get_or_create_user(message.from_user.id, message.from_user.username or "")
     welcome = await get_config("welcome_text") or DEFAULT_CONFIG["welcome_text"]
     image_id = await get_config("welcome_image_file_id", "")
-    keyboard = main_keyboard(message.from_user.id)
+    announcement = await get_config("announcement_text", "")
+    if announcement:
+        welcome += "\n\n📢 公告\n━━━━━━━━━━━━━━\n" + announcement
+    support_url = await get_config("support_url", "")
+    if support_url:
+        welcome += "\n\n🆘 客服：" + support_url
+    welcome = welcome[:3900]
+    keyboard = await main_keyboard(message.from_user.id)
     if image_id:
         try:
             if len(welcome) <= 1024:
                 await message.answer_photo(image_id, caption=welcome, reply_markup=keyboard)
             else:
-                await message.answer_photo(image_id, caption="🌷 欢迎来到「悦己」", reply_markup=keyboard)
-                await message.answer(welcome)
+                await message.answer_photo(image_id, caption="🌷 欢迎来到「悦己」")
+                await message.answer(welcome, reply_markup=keyboard)
         except Exception:
             await message.answer(welcome, reply_markup=keyboard)
     else:
@@ -653,11 +959,12 @@ async def cmd_set(message: Message):
         await message.answer("用法：/set 键 值")
         return
     key, value = args[1], args[2]
-    if key not in DEFAULT_CONFIG:
-        await message.answer("无效配置键")
+    normalized, error = await validate_config_value(key, value)
+    if error:
+        await message.answer(error)
         return
-    await set_config(key, value)
-    await message.answer(f"已更新 {key} = {value}")
+    await set_config(key, normalized)
+    await message.answer(f"✅ 已更新 {key} = {normalized}")
 
 
 @dp.message(F.text == "⚙️ 设置中心")
@@ -668,12 +975,18 @@ async def settings_center(message: Message):
         [InlineKeyboardButton(text="🎁 新用户赠送积分", callback_data="settings_start_points")],
         [InlineKeyboardButton(text="📅 每日签到奖励", callback_data="settings_checkin")],
         [InlineKeyboardButton(text="🛍️ 积分购买档位", callback_data="settings_buy_options")],
-        [InlineKeyboardButton(text="🎲 随机资源数量", callback_data="settings_random_count")],
+        [InlineKeyboardButton(text="🎲 随机文件夹数量", callback_data="settings_random_count")],
         [InlineKeyboardButton(text="📦 文件夹解锁价格", callback_data="settings_source_price")],
+        [InlineKeyboardButton(text="⏱️ 解锁后浏览时长", callback_data="settings_browse_limit")],
+        [InlineKeyboardButton(text="📅 每日解锁上限", callback_data="settings_daily_unlock_limit")],
+        [InlineKeyboardButton(text="🧩 用户菜单管理", callback_data="settings_menu_manage")],
+        [InlineKeyboardButton(text="📢 公告文案", callback_data="settings_text:announcement_text"), InlineKeyboardButton(text="🆘 客服链接", callback_data="settings_text:support_url")],
         [InlineKeyboardButton(text="✏️ 修改欢迎文案", callback_data="settings_text:welcome_text"), InlineKeyboardButton(text="💡 修改帮助文案", callback_data="settings_text:help_text")],
         [InlineKeyboardButton(text="🖼️ 设置欢迎图片", callback_data="settings_welcome_image")],
         [InlineKeyboardButton(text="🎟️ 兑换码管理", callback_data="codes_manage")],
         [InlineKeyboardButton(text="📚 资源仓库管理", callback_data="source_repo_manage")],
+        [InlineKeyboardButton(text="👥 用户与积分管理", callback_data="admin_users")],
+        [InlineKeyboardButton(text="💾 发送数据库备份", callback_data="admin_db_backup")],
         [InlineKeyboardButton(text="📋 查看当前设置", callback_data="settings_show")],
     ])
     await message.answer("⚙️ 悦己设置中心\n━━━━━━━━━━━━━━\n请选择要调整的项目。大部分设置可直接点击完成。", reply_markup=kb)
@@ -688,11 +1001,18 @@ async def settings_home_callback(callback: CallbackQuery):
         [InlineKeyboardButton(text="🎁 新用户赠送积分", callback_data="settings_start_points")],
         [InlineKeyboardButton(text="📅 每日签到奖励", callback_data="settings_checkin")],
         [InlineKeyboardButton(text="🛍️ 积分购买档位", callback_data="settings_buy_options")],
-        [InlineKeyboardButton(text="🎲 随机资源数量", callback_data="settings_random_count")],
+        [InlineKeyboardButton(text="🎲 随机文件夹数量", callback_data="settings_random_count")],
+        [InlineKeyboardButton(text="📦 文件夹解锁价格", callback_data="settings_source_price")],
+        [InlineKeyboardButton(text="⏱️ 解锁后浏览时长", callback_data="settings_browse_limit")],
+        [InlineKeyboardButton(text="📅 每日解锁上限", callback_data="settings_daily_unlock_limit")],
+        [InlineKeyboardButton(text="🧩 用户菜单管理", callback_data="settings_menu_manage")],
+        [InlineKeyboardButton(text="📢 公告文案", callback_data="settings_text:announcement_text"), InlineKeyboardButton(text="🆘 客服链接", callback_data="settings_text:support_url")],
         [InlineKeyboardButton(text="✏️ 修改欢迎文案", callback_data="settings_text:welcome_text"), InlineKeyboardButton(text="💡 修改帮助文案", callback_data="settings_text:help_text")],
         [InlineKeyboardButton(text="🖼️ 设置欢迎图片", callback_data="settings_welcome_image")],
         [InlineKeyboardButton(text="🎟️ 兑换码管理", callback_data="codes_manage")],
         [InlineKeyboardButton(text="📚 资源仓库管理", callback_data="source_repo_manage")],
+        [InlineKeyboardButton(text="👥 用户与积分管理", callback_data="admin_users")],
+        [InlineKeyboardButton(text="💾 发送数据库备份", callback_data="admin_db_backup")],
         [InlineKeyboardButton(text="📋 查看当前设置", callback_data="settings_show")],
     ])
     await callback.message.edit_text("⚙️ 悦己设置中心\n━━━━━━━━━━━━━━\n请选择要调整的项目。", reply_markup=kb)
@@ -932,6 +1252,146 @@ async def codes_generate(callback: CallbackQuery):
     await callback.message.edit_reply_markup(reply_markup=None)
 
 
+@dp.callback_query(F.data == "admin_user_search")
+async def admin_user_search(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    pending_config[callback.from_user.id] = "admin_user_search"
+    await callback.message.answer("🔍 请发送用户的 Telegram 数字 ID 或用户名（可带 @）。发送「取消设置」可退出。")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_users_clear_search")
+async def admin_users_clear_search(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    admin_user_search_queries.pop(callback.from_user.id, None)
+    await admin_users(callback, answer_callback=False)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "admin_users")
+async def admin_users(callback: CallbackQuery, answer_callback: bool = True):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    query = admin_user_search_queries.get(callback.from_user.id, "").strip().lstrip("@")
+    async with aiosqlite.connect(DB_PATH) as db:
+        if query:
+            async with db.execute(
+                """SELECT user_id, username, points, banned FROM users
+                   WHERE CAST(user_id AS TEXT)=? OR username LIKE ?
+                   ORDER BY rowid DESC LIMIT 10""",
+                (query, f"%{query}%"),
+            ) as cur:
+                rows = await cur.fetchall()
+            async with db.execute(
+                """SELECT COUNT(*) FROM users
+                   WHERE CAST(user_id AS TEXT)=? OR username LIKE ?""",
+                (query, f"%{query}%"),
+            ) as cur:
+                count_row = await cur.fetchone()
+        else:
+            async with db.execute(
+                "SELECT user_id, username, points, banned FROM users ORDER BY rowid DESC LIMIT 10"
+            ) as cur:
+                rows = await cur.fetchall()
+            async with db.execute("SELECT COUNT(*) FROM users") as cur:
+                count_row = await cur.fetchone()
+    title = "🔍 用户搜索结果" if query else "👥 用户与积分管理"
+    lines = [
+        title,
+        "━━━━━━━━━━━━━━",
+        f"👤 用户总数：{int(count_row[0] or 0)}" + (f"（搜索：{query}）" if query else ""),
+        "显示最多 10 位用户，可增减积分或封禁/解封。",
+        "",
+    ]
+    buttons = []
+    for uid, username, points, banned in rows:
+        label = (("@" + username) if username else str(uid))[:24]
+        lines.append(f"• {label}（ID {uid}）：{int(points or 0)} 积分｜{'🚫 已封禁' if banned else '🟢 正常'}")
+        buttons.append([
+            InlineKeyboardButton(text="➕10", callback_data=f"admin_points:{uid}:10"),
+            InlineKeyboardButton(text="➕50", callback_data=f"admin_points:{uid}:50"),
+            InlineKeyboardButton(text="➖10", callback_data=f"admin_points:{uid}:-10"),
+            InlineKeyboardButton(text=("🔓 解封" if banned else "🚫 封禁"), callback_data=f"admin_ban:{uid}:{0 if banned else 1}"),
+        ])
+    if not rows:
+        lines.append("没有找到匹配用户。")
+    buttons.append([InlineKeyboardButton(text="🔍 搜索用户", callback_data="admin_user_search")])
+    if query:
+        buttons.append([InlineKeyboardButton(text="📋 返回最近用户", callback_data="admin_users_clear_search")])
+    buttons.append([InlineKeyboardButton(text="🔄 刷新", callback_data="admin_users")])
+    buttons.append([InlineKeyboardButton(text="↩️ 返回设置中心", callback_data="settings_home")])
+    text = "\n".join(lines)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    try:
+        await callback.message.edit_text(text, reply_markup=keyboard)
+    except Exception:
+        await callback.message.answer(text, reply_markup=keyboard)
+    if answer_callback:
+        await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_ban:"))
+async def admin_ban_user(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    try:
+        _, uid_text, banned_text = callback.data.split(":")
+        target_id, banned = int(uid_text), int(banned_text)
+    except (ValueError, TypeError):
+        await callback.answer("用户参数无效", show_alert=True)
+        return
+    if banned not in (0, 1):
+        await callback.answer("封禁参数无效", show_alert=True)
+        return
+    if target_id == ADMIN_ID:
+        await callback.answer("不能封禁机器人管理员。", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT 1 FROM users WHERE user_id=?", (target_id,)) as cur:
+            exists = await cur.fetchone()
+        if not exists:
+            await callback.answer("用户不存在", show_alert=True)
+            return
+        await db.execute("UPDATE users SET banned=? WHERE user_id=?", (banned, target_id))
+        await db.commit()
+    await callback.answer("已封禁用户" if banned else "已解除封禁")
+    await admin_users(callback, answer_callback=False)
+
+
+@dp.callback_query(F.data.startswith("admin_points:"))
+async def admin_adjust_points(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    try:
+        _, uid_text, delta_text = callback.data.split(":")
+        target_id, delta = int(uid_text), int(delta_text)
+    except (ValueError, TypeError):
+        await callback.answer("参数无效", show_alert=True)
+        return
+    if delta not in (-50, -10, 10, 50):
+        await callback.answer("不支持的积分调整值", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT points FROM users WHERE user_id=?", (target_id,)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await callback.answer("用户不存在", show_alert=True)
+            return
+        new_points = max(0, int(row[0] or 0) + delta)
+        actual_delta = new_points - int(row[0] or 0)
+        await db.execute("UPDATE users SET points=? WHERE user_id=?", (new_points, target_id))
+        await db.commit()
+    await callback.answer(f"积分已调整：{actual_delta:+d}，余额 {new_points}")
+    await admin_users(callback, answer_callback=False)
+
+
 @dp.callback_query(F.data == "settings_start_points")
 async def settings_start_points(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -964,9 +1424,20 @@ async def settings_buy_options(callback: CallbackQuery):
         [InlineKeyboardButton(text="10 / 30 / 50 / 100", callback_data="cfgset:buy_options:10,30,50,100")],
         [InlineKeyboardButton(text="5 / 15 / 30 / 60 / 100", callback_data="cfgset:buy_options:5,15,30,60,100")],
         [InlineKeyboardButton(text="20 / 50 / 100 / 200", callback_data="cfgset:buy_options:20,50,100,200")],
+        [InlineKeyboardButton(text="✏️ 自定义积分档位", callback_data="settings_buy_options_custom")],
         [InlineKeyboardButton(text="↩️ 返回设置", callback_data="settings_home")],
     ])
     await callback.message.edit_text("🛍️ 请选择积分购买档位。提示：当前购买按钮仅为档位展示，真实支付尚未接入。", reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settings_buy_options_custom")
+async def settings_buy_options_custom(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    pending_config[callback.from_user.id] = "buy_options"
+    await callback.message.answer("请发送积分档位列表，例如：10,30,50,100。最多 10 档，数值 1–100000 且不能重复。发送「取消设置」可退出。")
     await callback.answer()
 
 
@@ -985,6 +1456,241 @@ async def settings_source_price(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data == "settings_daily_unlock_limit")
+async def settings_daily_unlock_limit(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    current = await get_config("daily_unlock_limit", "0")
+    label = "不限量" if current == "0" else f"每天最多 {current} 个文件夹"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="不限量", callback_data="cfgset:daily_unlock_limit:0"),
+            InlineKeyboardButton(text="1 个", callback_data="cfgset:daily_unlock_limit:1"),
+            InlineKeyboardButton(text="3 个", callback_data="cfgset:daily_unlock_limit:3"),
+        ],
+        [
+            InlineKeyboardButton(text="5 个", callback_data="cfgset:daily_unlock_limit:5"),
+            InlineKeyboardButton(text="10 个", callback_data="cfgset:daily_unlock_limit:10"),
+            InlineKeyboardButton(text="自定义", callback_data="settings_daily_unlock_custom"),
+        ],
+        [InlineKeyboardButton(text="↩️ 返回设置中心", callback_data="settings_home")],
+    ])
+    await callback.message.edit_text(
+        f"📅 每日文件夹解锁上限\n当前：{label}\n\n"
+        "设置为 0 表示不限量。该上限只统计当天新解锁的文件夹；已解锁文件夹不会重复扣积分。",
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settings_daily_unlock_custom")
+async def settings_daily_unlock_custom(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    pending_config[callback.from_user.id] = "daily_unlock_limit"
+    await callback.message.answer("请发送每日最多解锁的文件夹数量（0–1000；0 表示不限量）。发送「取消设置」可退出。")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settings_menu_manage")
+async def settings_menu_manage(callback: CallbackQuery, answer_callback: bool = True):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    items = [
+        ("my_info", "menu_my_info_text", "menu_show_my_info", "我的信息"),
+        ("checkin", "menu_checkin_text", "menu_show_checkin", "每日签到"),
+        ("random", "menu_random_text", "menu_show_random", "随机资源"),
+        ("buy", "menu_buy_text", "menu_show_buy", "购买积分"),
+        ("help", "menu_help_text", "menu_show_help", "用户帮助"),
+    ]
+    order = [part.strip() for part in (await get_config("menu_order", DEFAULT_CONFIG["menu_order"])).split(",")]
+    lines = ["🧩 用户菜单管理", "━━━━━━━━━━━━━━", "菜单显示顺序：" + " → ".join(order)]
+    buttons = []
+    for item_key, text_key, show_key, title in items:
+        label = await get_config(text_key, DEFAULT_CONFIG[text_key])
+        visible = await get_config(show_key, "1") == "1"
+        lines.append(f"{'🟢 显示' if visible else '⚪️ 隐藏'}｜{title}：{label}")
+        buttons.append([
+            InlineKeyboardButton(text=f"✏️ 改名：{title}", callback_data=f"settings_menu_label:{text_key}"),
+            InlineKeyboardButton(text=("隐藏" if visible else "显示") + f"：{title}", callback_data=f"menu_toggle:{show_key}:{'0' if visible else '1'}"),
+        ])
+        buttons.append([
+            InlineKeyboardButton(text=f"⬆️ {title}", callback_data=f"menu_move:{item_key}:up"),
+            InlineKeyboardButton(text=f"⬇️ {title}", callback_data=f"menu_move:{item_key}:down"),
+        ])
+    buttons.append([InlineKeyboardButton(text="↩️ 返回设置中心", callback_data="settings_home")])
+    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    if answer_callback:
+        await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("settings_menu_label:"))
+async def settings_menu_label(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    key = callback.data.split(":", 1)[1]
+    if key not in ("menu_my_info_text", "menu_checkin_text", "menu_random_text", "menu_buy_text", "menu_help_text"):
+        await callback.answer("菜单设置项无效", show_alert=True)
+        return
+    pending_config[callback.from_user.id] = key
+    await callback.message.answer("请发送新的菜单按钮名称（最多 32 个字符，不能与其他菜单重名）。发送「取消设置」可退出。")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("menu_move:"))
+async def settings_menu_move(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    try:
+        _, item_key, direction = callback.data.split(":", 2)
+    except ValueError:
+        await callback.answer("菜单排序参数无效", show_alert=True)
+        return
+    allowed = ["my_info", "checkin", "random", "buy", "help"]
+    if item_key not in allowed or direction not in ("up", "down"):
+        await callback.answer("菜单排序参数无效", show_alert=True)
+        return
+    order = [part.strip() for part in (await get_config("menu_order", DEFAULT_CONFIG["menu_order"])).split(",")]
+    index = order.index(item_key)
+    target = index - 1 if direction == "up" else index + 1
+    if target < 0 or target >= len(order):
+        await callback.answer("已经到达边界", show_alert=True)
+        return
+    order[index], order[target] = order[target], order[index]
+    await set_config("menu_order", ",".join(order))
+    await callback.answer("菜单顺序已保存")
+    await settings_menu_manage(callback, answer_callback=False)
+
+
+@dp.callback_query(F.data.startswith("menu_toggle:"))
+async def settings_menu_toggle(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    try:
+        _, key, value = callback.data.split(":", 2)
+    except ValueError:
+        await callback.answer("菜单设置参数无效", show_alert=True)
+        return
+    normalized, error = await validate_config_value(key, value)
+    if error:
+        await callback.answer(error, show_alert=True)
+        return
+    await set_config(key, normalized)
+    await callback.answer("菜单显示状态已保存")
+    await settings_menu_manage(callback, answer_callback=False)
+
+
+@dp.callback_query(F.data == "admin_db_backup")
+async def admin_db_backup(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    import tempfile
+    from aiogram.types import FSInputFile
+    backup_path = None
+    await callback.answer("正在生成数据库备份…")
+    try:
+        handle = tempfile.NamedTemporaryFile(prefix="yueji-backup-", suffix=".db", delete=False)
+        backup_path = handle.name
+        handle.close()
+        async with aiosqlite.connect(DB_PATH) as source:
+            async with aiosqlite.connect(backup_path) as target:
+                await source.backup(target)
+        filename = "yueji-backup-" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".db"
+        await bot.send_document(
+            callback.from_user.id,
+            FSInputFile(backup_path, filename=filename),
+            caption="悦己数据库备份。请妥善保管，文件包含用户积分、兑换码及解锁记录。",
+        )
+        await callback.message.answer("✅ 数据库备份已私信发送给管理员。")
+    except Exception as exc:
+        await callback.message.answer("❌ 数据库备份失败，请检查机器人私聊权限和磁盘空间。")
+        print("Database backup failed:", str(exc)[:250])
+    finally:
+        if backup_path and os.path.exists(backup_path):
+            try:
+                os.remove(backup_path)
+            except OSError:
+                pass
+
+
+@dp.callback_query(F.data == "settings_browse_limit")
+async def settings_browse_limit(callback: CallbackQuery, answer_callback: bool = True):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    minutes = await get_config("browse_minutes", "5")
+    scope = await get_config("browse_scope", "all")
+    admin_exempt = await get_config("browse_admin_exempt", "1")
+    duration_label = "不限时" if minutes == "0" else f"{minutes} 分钟"
+    scope_label = "全部资源" if scope == "all" else "仅视频"
+    admin_label = "管理员免限时" if admin_exempt == "1" else "管理员也限时"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="3 分钟", callback_data="cfgset:browse_minutes:3"),
+            InlineKeyboardButton(text="5 分钟", callback_data="cfgset:browse_minutes:5"),
+            InlineKeyboardButton(text="10 分钟", callback_data="cfgset:browse_minutes:10"),
+        ],
+        [
+            InlineKeyboardButton(text="不限时", callback_data="cfgset:browse_minutes:0"),
+            InlineKeyboardButton(text="自定义分钟", callback_data="settings_browse_custom"),
+        ],
+        [
+            InlineKeyboardButton(text="限制全部资源", callback_data="browse_config:browse_scope:all"),
+            InlineKeyboardButton(text="只限制视频", callback_data="browse_config:browse_scope:videos"),
+        ],
+        [InlineKeyboardButton(
+            text=("管理员免限时：开启" if admin_exempt == "1" else "管理员免限时：关闭"),
+            callback_data=f"browse_config:browse_admin_exempt:{'0' if admin_exempt == '1' else '1'}",
+        )],
+        [InlineKeyboardButton(text="↩️ 返回设置中心", callback_data="settings_home")],
+    ])
+    await callback.message.edit_text(
+        "⏱️ 解锁后浏览时长设置\n━━━━━━━━━━━━━━\n"
+        f"当前时长：{duration_label}\n限制范围：{scope_label}\n管理员：{admin_label}\n\n"
+        "计时从用户点击「开始浏览资源」时开始。到期后阻止新的受限资源发送，已发送的消息无法撤回。"
+        "\n注意：新设置只影响之后开始的浏览会话。",
+        reply_markup=kb,
+    )
+    if answer_callback:
+        await callback.answer()
+
+
+@dp.callback_query(F.data == "settings_browse_custom")
+async def settings_browse_custom(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    pending_config[callback.from_user.id] = "browse_minutes"
+    await callback.message.answer("请发送浏览时长分钟数（1–1440；发送 0 表示不限时）。发送「取消设置」可取消。")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("browse_config:"))
+async def settings_browse_config(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    try:
+        _, key, value = callback.data.split(":", 2)
+    except ValueError:
+        await callback.answer("设置参数无效", show_alert=True)
+        return
+    normalized, error = await validate_config_value(key, value)
+    if error:
+        await callback.answer(error, show_alert=True)
+        return
+    await set_config(key, normalized)
+    await callback.answer("设置已保存")
+    await settings_browse_limit(callback, answer_callback=False)
+
+
 @dp.callback_query(F.data == "settings_random_count")
 async def settings_random_count(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -992,7 +1698,7 @@ async def settings_random_count(callback: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=f"{n} 个", callback_data=f"cfgset:random_count:{n}") for n in (1, 3, 5, 10)
     ], [InlineKeyboardButton(text="↩️ 返回设置", callback_data="settings_home")]])
-    await callback.message.edit_text("🎲 请选择每次随机推送的资源数量：", reply_markup=kb)
+    await callback.message.edit_text("🎲 请选择每次随机推送的文件夹数量（1–10）：", reply_markup=kb)
     await callback.answer()
 
 
@@ -1001,12 +1707,13 @@ async def settings_set_value(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("无权限", show_alert=True); return
     _, key, value = callback.data.split(":", 2)
-    if key not in ("start_points", "buy_options", "random_count", "source_folder_price"):
+    if key not in ("start_points", "buy_options", "random_count", "source_folder_price", "browse_minutes", "daily_unlock_limit"):
         await callback.answer("不支持的设置项", show_alert=True); return
-    if key == "buy_options" and not all(x.strip().isdigit() for x in value.split(",")):
-        await callback.answer("档位格式不正确", show_alert=True); return
-    if key != "buy_options" and not value.isdigit():
-        await callback.answer("请输入数字", show_alert=True); return
+    normalized, error = await validate_config_value(key, value)
+    if error:
+        await callback.answer(error, show_alert=True)
+        return
+    value = normalized
     await set_config(key, value)
     await callback.message.edit_text(f"✅ 设置已保存\n\n{key} = {value}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ 返回设置中心", callback_data="settings_home")]]))
     await callback.answer("保存成功")
@@ -1016,9 +1723,17 @@ async def settings_set_value(callback: CallbackQuery):
 async def settings_set_checkin(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("无权限", show_alert=True); return
-    _, low, high = callback.data.split(":")
-    await set_config("checkin_min", low)
-    await set_config("checkin_max", high)
+    try:
+        _, low, high = callback.data.split(":")
+        low_n, high_n = int(low), int(high)
+    except (ValueError, TypeError):
+        await callback.answer("签到参数无效", show_alert=True)
+        return
+    if not (0 <= low_n <= high_n <= 100000):
+        await callback.answer("签到范围必须为 0–100000，且最低值不能高于最高值", show_alert=True)
+        return
+    await set_config("checkin_min", str(low_n))
+    await set_config("checkin_max", str(high_n))
     await callback.message.edit_text(f"✅ 签到奖励已设置为 {low}–{high} 积分。", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ 返回设置中心", callback_data="settings_home")]]))
     await callback.answer("保存成功")
 
@@ -1028,9 +1743,17 @@ async def settings_text_prompt(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("无权限", show_alert=True); return
     key = callback.data.split(":", 1)[1]
+    if key not in ("welcome_text", "help_text", "announcement_text", "support_url"):
+        await callback.answer("文案设置项无效", show_alert=True)
+        return
     pending_config[callback.from_user.id] = key
-    label = "欢迎文案" if key == "welcome_text" else "帮助文案"
-    await callback.message.answer(f"✏️ 请直接发送新的{label}。\n发送「取消设置」可取消。")
+    labels = {
+        "welcome_text": "欢迎文案",
+        "help_text": "帮助文案",
+        "announcement_text": "公告文案（发送「清空」可移除公告）",
+        "support_url": "客服链接（发送「清空」可移除客服链接）",
+    }
+    await callback.message.answer(f"✏️ 请直接发送新的{labels[key]}。\n发送「取消设置」可取消。")
     await callback.answer()
 
 
@@ -1111,6 +1834,7 @@ async def cmd_del(message: Message):
 
 upload_state = {}
 pending_config = {}
+admin_user_search_queries = {}
 
 
 @dp.message(F.text.contains("|") & F.from_user.id == ADMIN_ID)
@@ -1204,6 +1928,7 @@ async def my_info(message: Message):
 @dp.message(F.text == "每日签到")
 async def daily_checkin(message: Message):
     user_id = message.from_user.id
+    await get_or_create_user(user_id, message.from_user.username or "")
     today = date.today().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -1242,6 +1967,9 @@ async def buy_points(message: Message):
 @dp.message(F.text == "帮助")
 async def help_cmd(message: Message):
     help_text = await get_config("help_text")
+    support_url = await get_config("support_url", "")
+    if support_url:
+        help_text = (help_text or "") + "\n\n🆘 客服：" + support_url
     await message.answer(help_text)
 
 
@@ -1293,18 +2021,35 @@ async def send_resource_files(chat_id: int, file_ids_json: str):
 
 @dp.callback_query(F.data.startswith("unlock_"))
 async def unlock_callback(callback: CallbackQuery):
-    rid = int(callback.data.split("_")[1])
+    try:
+        rid = int(callback.data.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("资源编号无效", show_alert=True)
+        return
     user_id = callback.from_user.id
+    await get_or_create_user(user_id, callback.from_user.username or "")
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
         async with db.execute("SELECT price, file_ids FROM resources WHERE id = ?", (rid,)) as cursor:
             row = await cursor.fetchone()
         if not row:
-            await callback.answer("资源不存在")
+            await db.rollback()
+            await callback.answer("资源不存在", show_alert=True)
+            return
+        async with db.execute(
+            "SELECT 1 FROM unlocks WHERE user_id=? AND resource_id=?",
+            (user_id, rid),
+        ) as cursor:
+            existing = await cursor.fetchone()
+        if existing:
+            await db.rollback()
+            await callback.answer("你已解锁过该资源，不会重复扣积分。", show_alert=True)
             return
         price, file_ids = row
         async with db.execute("SELECT points FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            points = (await cursor.fetchone())[0]
-        if points < price:
+            user_row = await cursor.fetchone()
+        if not user_row or int(user_row[0] or 0) < int(price or 0):
+            await db.rollback()
             await callback.answer("积分不足", show_alert=True)
             return
         await db.execute(
@@ -1312,12 +2057,15 @@ async def unlock_callback(callback: CallbackQuery):
             (price, price, user_id),
         )
         await db.execute(
-            "INSERT OR IGNORE INTO unlocks (user_id, resource_id, unlocked_at) VALUES (?, ?, datetime('now'))",
+            "INSERT INTO unlocks (user_id, resource_id, unlocked_at) VALUES (?, ?, datetime('now'))",
             (user_id, rid),
         )
         await db.commit()
     await callback.answer("解锁成功")
-    await callback.message.edit_reply_markup(reply_markup=None)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
     await callback.message.answer("🎉 解锁成功！\n━━━━━━━━━━━━━━\n📦 正在为你发送资源，请稍候…")
     await send_resource_files(callback.message.chat.id, file_ids)
 
@@ -1355,6 +2103,24 @@ async def buy_callback(callback: CallbackQuery):
     await callback.answer("请按管理员提供的购买渠道获取兑换码，再点击「输入积分兑换码」。", show_alert=True)
 
 
+async def dispatch_custom_menu(message: Message):
+    text = (message.text or "").strip()
+    items = [
+        ("menu_show_my_info", "menu_my_info_text", my_info),
+        ("menu_show_checkin", "menu_checkin_text", daily_checkin),
+        ("menu_show_random", "menu_random_text", random_resource),
+        ("menu_show_buy", "menu_buy_text", buy_points),
+        ("menu_show_help", "menu_help_text", help_cmd),
+    ]
+    for show_key, text_key, handler in items:
+        label = await get_config(text_key, DEFAULT_CONFIG[text_key])
+        visible = await get_config(show_key, "1") == "1"
+        if visible and text == label:
+            await handler(message)
+            return True
+    return False
+
+
 @dp.message(F.from_user.id == ADMIN_ID)
 async def handle_pending_admin_text(message: Message):
     user_id = message.from_user.id
@@ -1363,10 +2129,79 @@ async def handle_pending_admin_text(message: Message):
         return
     key = pending_config.get(user_id)
     if not key or key == "welcome_image_file_id":
+        if not key:
+            await dispatch_custom_menu(message)
         return
     if message.text == "取消设置":
         pending_config.pop(user_id, None)
         await message.answer("已取消本次设置。")
+        return
+    if key == "admin_user_search":
+        query = (message.text or "").strip().lstrip("@")
+        if not query or len(query) > 64:
+            await message.answer("请输入有效的用户 ID 或用户名（最多 64 个字符）。")
+            return
+        admin_user_search_queries[user_id] = query
+        pending_config.pop(user_id, None)
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                """SELECT user_id, username, points, banned FROM users
+                   WHERE CAST(user_id AS TEXT)=? OR username LIKE ?
+                   ORDER BY rowid DESC LIMIT 10""",
+                (query, f"%{query}%"),
+            ) as cur:
+                rows = await cur.fetchall()
+            async with db.execute(
+                """SELECT COUNT(*) FROM users
+                   WHERE CAST(user_id AS TEXT)=? OR username LIKE ?""",
+                (query, f"%{query}%"),
+            ) as cur:
+                count_row = await cur.fetchone()
+        lines = [
+            "🔍 用户搜索结果",
+            "━━━━━━━━━━━━━━",
+            f"匹配用户：{int(count_row[0] or 0)}（搜索：{query}）",
+            "最多显示 10 位，可增减积分或封禁/解封。",
+            "",
+        ]
+        buttons = []
+        for uid, username, points, banned in rows:
+            label = (("@" + username) if username else str(uid))[:24]
+            lines.append(f"• {label}（ID {uid}）：{int(points or 0)} 积分｜{'🚫 已封禁' if banned else '🟢 正常'}")
+            buttons.append([
+                InlineKeyboardButton(text="➕10", callback_data=f"admin_points:{uid}:10"),
+                InlineKeyboardButton(text="➕50", callback_data=f"admin_points:{uid}:50"),
+                InlineKeyboardButton(text="➖10", callback_data=f"admin_points:{uid}:-10"),
+                InlineKeyboardButton(text=("🔓 解封" if banned else "🚫 封禁"), callback_data=f"admin_ban:{uid}:{0 if banned else 1}"),
+            ])
+        if not rows:
+            lines.append("没有找到匹配用户。")
+        buttons.append([InlineKeyboardButton(text="🔍 重新搜索", callback_data="admin_user_search")])
+        buttons.append([InlineKeyboardButton(text="📋 最近用户", callback_data="admin_users_clear_search")])
+        await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+        return
+    if key == "buy_options":
+        normalized, error = await validate_config_value("buy_options", message.text or "")
+        if error:
+            await message.answer(error + "\n请重新发送档位列表，或发送「取消设置」。")
+            return
+        await set_config("buy_options", normalized)
+        pending_config.pop(user_id, None)
+        await message.answer("✅ 积分档位已保存：" + normalized)
+        return
+    if key in ("browse_minutes", "daily_unlock_limit"):
+        normalized, error = await validate_config_value(key, message.text or "")
+        if error:
+            await message.answer(error + "\n请重新发送数字，或发送「取消设置」。")
+            return
+        await set_config(key, normalized)
+        pending_config.pop(user_id, None)
+        if key == "browse_minutes":
+            result_label = "不限时" if normalized == "0" else normalized + " 分钟"
+            await message.answer("✅ 浏览时长已保存：" + result_label)
+        else:
+            result_label = "不限量" if normalized == "0" else "每天最多 " + normalized + " 个文件夹"
+            await message.answer("✅ 每日解锁上限已保存：" + result_label)
         return
     if key == "source_repo_id":
         repo_id = (message.text or "").strip()
@@ -1377,14 +2212,33 @@ async def handle_pending_admin_text(message: Message):
         pending_config.pop(user_id, None)
         await message.answer(f"✅ 已保存原仓库频道 ID：{repo_id}\n请到「📚 资源仓库管理」点击「同步文件夹与文件」。")
         return
-    if key not in ("welcome_text", "help_text"):
+    if key in ("menu_my_info_text", "menu_checkin_text", "menu_random_text", "menu_buy_text", "menu_help_text"):
+        normalized, error = await validate_config_value(key, message.text or "")
+        if error:
+            await message.answer(error + "\n请重新发送名称，或发送「取消设置」。")
+            return
+        await set_config(key, normalized)
+        pending_config.pop(user_id, None)
+        await message.answer("✅ 菜单名称已保存。用户下次发送 /start 后会看到新名称。")
         return
-    if not message.text or len(message.text) > 3500:
-        await message.answer("文案不能为空，且请控制在 3500 字以内。")
+    if key not in ("welcome_text", "help_text", "announcement_text", "support_url"):
         return
-    await set_config(key, message.text)
+    raw_value = (message.text or "").strip()
+    if key in ("announcement_text", "support_url") and raw_value in ("清空", "关闭", "无"):
+        raw_value = ""
+    normalized, error = await validate_config_value(key, raw_value)
+    if error:
+        await message.answer(error + "\n请重新发送，或发送「取消设置」。")
+        return
+    await set_config(key, normalized)
     pending_config.pop(user_id, None)
-    await message.answer("✅ 文案已保存！\n下次用户打开对应页面时就会使用新文案。")
+    if key == "support_url":
+        result = "已清除客服链接。" if not normalized else "客服链接已保存。"
+    elif key == "announcement_text":
+        result = "已清除公告。" if not normalized else "公告已保存，用户下次发送 /start 时会看到。"
+    else:
+        result = "文案已保存！下次用户打开对应页面时就会使用新文案。"
+    await message.answer("✅ " + result)
 
 
 @dp.message(F.text)
@@ -1395,6 +2249,7 @@ async def redeem_code_message(message: Message):
         await message.answer("已取消兑换。")
         return
     if user_id not in redeem_state:
+        await dispatch_custom_menu(message)
         return
     code = (message.text or "").strip().upper().replace(" ", "")
     if not code or len(code) > 40:
