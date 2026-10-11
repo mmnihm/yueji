@@ -1541,6 +1541,7 @@ async def admin_db_backup(callback: CallbackQuery):
     import tempfile
     from aiogram.types import FSInputFile
     backup_path = None
+    await callback.answer("正在生成数据库备份…")
     try:
         handle = tempfile.NamedTemporaryFile(prefix="yueji-backup-", suffix=".db", delete=False)
         backup_path = handle.name
@@ -1554,9 +1555,9 @@ async def admin_db_backup(callback: CallbackQuery):
             FSInputFile(backup_path, filename=filename),
             caption="悦己数据库备份。请妥善保管，文件包含用户积分、兑换码及解锁记录。",
         )
-        await callback.answer("备份已发送给管理员")
+        await callback.message.answer("✅ 数据库备份已私信发送给管理员。")
     except Exception as exc:
-        await callback.answer("备份失败，请检查机器人私聊权限和磁盘空间。", show_alert=True)
+        await callback.message.answer("❌ 数据库备份失败，请检查机器人私聊权限和磁盘空间。")
         print("Database backup failed:", str(exc)[:250])
     finally:
         if backup_path and os.path.exists(backup_path):
