@@ -944,7 +944,7 @@ async def codes_generate(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data == "admin_users")
-async def admin_users(callback: CallbackQuery):
+async def admin_users(callback: CallbackQuery, answer_callback: bool = True):
     if not is_admin(callback.from_user.id):
         await callback.answer("无权限", show_alert=True)
         return
@@ -978,7 +978,8 @@ async def admin_users(callback: CallbackQuery):
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
     )
-    await callback.answer()
+    if answer_callback:
+        await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("admin_points:"))
@@ -1006,7 +1007,7 @@ async def admin_adjust_points(callback: CallbackQuery):
         await db.execute("UPDATE users SET points=? WHERE user_id=?", (new_points, target_id))
         await db.commit()
     await callback.answer(f"积分已调整：{actual_delta:+d}，余额 {new_points}")
-    await admin_users(callback)
+    await admin_users(callback, answer_callback=False)
 
 
 @dp.callback_query(F.data == "settings_start_points")
