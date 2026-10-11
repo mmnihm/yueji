@@ -246,7 +246,7 @@ async def codes_manage(callback: CallbackQuery):
         [InlineKeyboardButton(text="↩️ 返回设置", callback_data="settings_home")],
     ])
     await callback.message.edit_text(
-        "🎟️ 兑换码管理\\n━━━━━━━━━━━━━━\\n先选择每个兑换码对应的积分，再选择生成数量。\\n每个兑换码只能成功兑换一次。",
+        "🎟️ 兑换码管理\n━━━━━━━━━━━━━━\n先选择每个兑换码对应的积分，再选择生成数量。\n每个兑换码只能成功兑换一次。",
         reply_markup=kb,
     )
     await callback.answer()
@@ -268,7 +268,7 @@ async def codes_choose_quantity(callback: CallbackQuery):
          InlineKeyboardButton(text="生成 20 个", callback_data=f"codes_generate:{points}:20")],
         [InlineKeyboardButton(text="↩️ 返回兑换码管理", callback_data="codes_manage")],
     ])
-    await callback.message.edit_text(f"🎟️ 每个兑换码价值 {points} 积分。\\n请选择本次生成数量：", reply_markup=kb)
+    await callback.message.edit_text(f"🎟️ 每个兑换码价值 {points} 积分。\n请选择本次生成数量：", reply_markup=kb)
     await callback.answer()
 
 
@@ -297,9 +297,9 @@ async def codes_generate(callback: CallbackQuery):
             )
             generated.append(code)
         await db.commit()
-    body = "\\n".join(generated)
+    body = "\n".join(generated)
     await callback.message.answer(
-        f"✅ 已生成 {quantity} 个兑换码\\n每个兑换码：{points} 积分\\n\\n{body}\\n\\n请妥善保管并只发给已完成付款的用户。兑换码可使用一次。"
+        f"✅ 已生成 {quantity} 个兑换码\n每个兑换码：{points} 积分\n\n{body}\n\n请妥善保管并只发给已完成付款的用户。兑换码可使用一次。"
     )
     await callback.answer("生成成功")
     await callback.message.edit_reply_markup(reply_markup=None)
@@ -717,7 +717,7 @@ redeem_state = set()
 @dp.callback_query(F.data == "redeem_start")
 async def redeem_start(callback: CallbackQuery):
     redeem_state.add(callback.from_user.id)
-    await callback.message.answer("🎟️ 请发送你的积分兑换码。\\n发送「取消兑换」可退出。")
+    await callback.message.answer("🎟️ 请发送你的积分兑换码。\n发送「取消兑换」可退出。")
     await callback.answer()
 
 
@@ -729,6 +729,9 @@ async def buy_callback(callback: CallbackQuery):
 @dp.message(F.from_user.id == ADMIN_ID)
 async def handle_pending_admin_text(message: Message):
     user_id = message.from_user.id
+    if user_id in redeem_state:
+        await redeem_code_message(message)
+        return
     key = pending_config.get(user_id)
     if not key or key == "welcome_image_file_id":
         return
@@ -787,7 +790,7 @@ async def redeem_code_message(message: Message):
     redeem_state.discard(user_id)
     new_points, _, _ = await get_or_create_user(user_id, message.from_user.username or "")
     await message.answer(
-        f"🎉 兑换成功！\\n━━━━━━━━━━━━━━\\n🎟️ 兑换积分：+{points}\\n💎 当前余额：{new_points} 积分"
+        f"🎉 兑换成功！\n━━━━━━━━━━━━━━\n🎟️ 兑换积分：+{points}\n💎 当前余额：{new_points} 积分"
     )
 
 
