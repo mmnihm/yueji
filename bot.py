@@ -377,7 +377,7 @@ async def send_source_folder_card(message: Message, folder):
     price = int(await get_config("source_folder_price", "10") or 10)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT chat_id, message_id, file_type, file_id, data FROM source_resources WHERE folder_id=? ORDER BY message_id LIMIT 20",
+            "SELECT chat_id, message_id, file_type, file_id, data FROM source_resources WHERE folder_id=? ORDER BY message_id",
             (str(fid),),
         ) as cur:
             candidates = await cur.fetchall()
@@ -397,12 +397,13 @@ async def send_source_folder_card(message: Message, folder):
         [InlineKeyboardButton(text=f"🔓 解锁整个文件夹（{price} 积分）", callback_data=f"source_unlock:{fid}")],
         [InlineKeyboardButton(text="🎲 再随机一个文件夹", callback_data="source_random_again")],
     ])
-    preview_rows = [(chat_id, mid) for chat_id, mid, _, _, _ in candidates[:3]]
-    # If the source records contain reusable Telegram file IDs, combine up to three
-    # photo/video previews into one album. Keep the descriptive text and buttons below it.
-    if not already_unlocked and len(preview_rows) >= 2:
-        album = []
-        for index, (chat_id, mid, file_type, stored_file_id, raw) in enumerate(candidates[:3]):
+
+    # Only photo/video items can be combined in a Telegram album. Scan the whole
+    # folder so unsupported records at the beginning don't prevent usable items
+    # later in the list from being previewed. Keep at most three usable items.
+    album = []
+    if not already_unlocked:
+        for _, _, file_type, stored_file_id, raw in candidates:
             kind = str(file_type or "").lower()
             try:
                 payload = json.loads(raw or "{}")
@@ -410,51 +411,57 @@ async def send_source_folder_card(message: Message, folder):
                 payload = {}
             file_id = str(stored_file_id or payload.get("fileId") or payload.get("file_id") or "").strip()
             if not file_id:
-                album = []
-                break
-            # Telegram album captions are attached to one media item; put the full
-            # folder description on the first item so the text is part of the album.
-            caption = text if index == 0 else None
+                continue
             if "photo" in kind or "image" in kind or "picture" in kind:
-                album.append(InputMediaPhoto(media=file_id, caption=caption))
+                album.append(("photo", file_id))
             elif "video" in kind:
-                album.append(InputMediaVideo(media=file_id, caption=caption))
-            else:
-                # Telegram media albums do not support animations/documents as album items.
-                album = []
+                album.append(("video", file_id))
+            if len(album) >= 3:
                 break
-        if 2 <= len(album) <= 3:
-            try:
-                await bot.send_media_group(
-                    chat_id=message.chat.id,
-                    media=album,
-                    protect_content=True,
-                )
-                # Telegram Bot API does not support inline buttons on sendMediaGroup.
-                # Keep the album caption attached to the first item and put actions below it.
-                await message.answer("👇 选择操作：", reply_markup=kb)
-                return
-            except Exception as exc:
-                print("Source preview album error:", str(exc)[:300])
-                await message.answer("⚠️ 这组预览暂时无法合并成相册，未拆开发送。请管理员检查资源文件类型和文件 ID。")
-                return
 
-    # Do not send the description separately: the user's requirement is that it
-    # must be the caption of the same album. If album creation is impossible,
-    # report failure rather than sending separate text and files.
-    if not already_unlocked and preview_rows:
-        await message.answer("⚠️ 当前这组资源无法组成相册（需要 2–3 个可用的图片/视频文件 ID）。为避免文字与相册分开，本次没有拆开发送。")
+    # Telegram requires at least two media items in an album. If only two
+    # usable items exist, send those two; if fewer than two exist, let the
+    # random-folder selector skip this folder and try another one.
+    if len(album) >= 2:
+        media = []
+        for index, (kind, file_id) in enumerate(album):
+            caption = text if index == 0 else None
+            if kind == "photo":
+                media.append(InputMediaPhoto(media=file_id, caption=caption))
+            else:
+                media.append(InputMediaVideo(media=file_id, caption=caption))
+        try:
+            await bot.send_media_group(
+                chat_id=message.chat.id,
+                media=media,
+                protect_content=True,
+            )
+            await message.answer("👇 选择操作：", reply_markup=kb)
+            return True
+        except Exception as exc:
+            print("Source preview album error:", str(exc)[:300])
+            return False
+
+    return False
+
 
 async def choose_random_source_folder(message: Message):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT source_folder_id, name, item_count, image_count, video_count, file_count FROM source_folders WHERE item_count > 0 ORDER BY RANDOM() LIMIT 1"
+            "SELECT source_folder_id, name, item_count, image_count, video_count, file_count "
+            "FROM source_folders WHERE item_count > 0 ORDER BY RANDOM()"
         ) as cur:
-            folder = await cur.fetchone()
-    if not folder:
+            folders = await cur.fetchall()
+    if not folders:
         return False
-    await send_source_folder_card(message, folder)
-    return True
+
+    # Skip folders that have fewer than two usable photo/video file IDs, and
+    # continue to the next random folder instead of stopping at the first failure.
+    for folder in folders:
+        if await send_source_folder_card(message, folder):
+            return True
+    await message.answer("📭 暂时没有找到至少包含两个可用图片/视频的文件夹，已跳过无法组成相册的文件夹。")
+    return False
 
 
 @dp.callback_query(F.data == "source_random_again")
