@@ -440,10 +440,18 @@ async def choose_random_source_folder(message: Message):
     if not folders:
         return False
 
-    for folder in folders:
+    # Respect the admin-configured random count. Clamp it defensively so a bad
+    # database value cannot cause an unexpectedly large burst of messages.
+    try:
+        requested = int(await get_config("random_count", "3") or 3)
+    except (TypeError, ValueError):
+        requested = 3
+    requested = max(1, min(requested, 10))
+    sent_cards = 0
+    for folder in folders[:requested]:
         if await send_source_folder_card(message, folder):
-            return True
-    return False
+            sent_cards += 1
+    return sent_cards > 0
 
 
 @dp.callback_query(F.data == "source_random_again")
@@ -674,6 +682,7 @@ async def settings_center(message: Message):
         [InlineKeyboardButton(text="🖼️ 设置欢迎图片", callback_data="settings_welcome_image")],
         [InlineKeyboardButton(text="🎟️ 兑换码管理", callback_data="codes_manage")],
         [InlineKeyboardButton(text="📚 资源仓库管理", callback_data="source_repo_manage")],
+        [InlineKeyboardButton(text="👥 用户与积分管理", callback_data="admin_users")],
         [InlineKeyboardButton(text="📋 查看当前设置", callback_data="settings_show")],
     ])
     await message.answer("⚙️ 悦己设置中心\n━━━━━━━━━━━━━━\n请选择要调整的项目。大部分设置可直接点击完成。", reply_markup=kb)
@@ -689,10 +698,12 @@ async def settings_home_callback(callback: CallbackQuery):
         [InlineKeyboardButton(text="📅 每日签到奖励", callback_data="settings_checkin")],
         [InlineKeyboardButton(text="🛍️ 积分购买档位", callback_data="settings_buy_options")],
         [InlineKeyboardButton(text="🎲 随机资源数量", callback_data="settings_random_count")],
+        [InlineKeyboardButton(text="📦 文件夹解锁价格", callback_data="settings_source_price")],
         [InlineKeyboardButton(text="✏️ 修改欢迎文案", callback_data="settings_text:welcome_text"), InlineKeyboardButton(text="💡 修改帮助文案", callback_data="settings_text:help_text")],
         [InlineKeyboardButton(text="🖼️ 设置欢迎图片", callback_data="settings_welcome_image")],
         [InlineKeyboardButton(text="🎟️ 兑换码管理", callback_data="codes_manage")],
         [InlineKeyboardButton(text="📚 资源仓库管理", callback_data="source_repo_manage")],
+        [InlineKeyboardButton(text="👥 用户与积分管理", callback_data="admin_users")],
         [InlineKeyboardButton(text="📋 查看当前设置", callback_data="settings_show")],
     ])
     await callback.message.edit_text("⚙️ 悦己设置中心\n━━━━━━━━━━━━━━\n请选择要调整的项目。", reply_markup=kb)
@@ -932,6 +943,72 @@ async def codes_generate(callback: CallbackQuery):
     await callback.message.edit_reply_markup(reply_markup=None)
 
 
+@dp.callback_query(F.data == "admin_users")
+async def admin_users(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id, username, points FROM users ORDER BY rowid DESC LIMIT 10"
+        ) as cur:
+            rows = await cur.fetchall()
+        async with db.execute("SELECT COUNT(*) FROM users") as cur:
+            count_row = await cur.fetchone()
+    lines = [
+        "👥 用户与积分管理",
+        "━━━━━━━━━━━━━━",
+        f"👤 用户总数：{int(count_row[0] or 0)}",
+        "显示最近注册/创建的 10 位用户，可直接增减积分。",
+        "",
+    ]
+    buttons = []
+    for uid, username, points in rows:
+        label = (("@" + username) if username else str(uid))[:24]
+        lines.append(f"• {label}（ID {uid}）：{int(points or 0)} 积分")
+        buttons.append([
+            InlineKeyboardButton(text=f"➕10", callback_data=f"admin_points:{uid}:10"),
+            InlineKeyboardButton(text=f"➕50", callback_data=f"admin_points:{uid}:50"),
+            InlineKeyboardButton(text=f"➖10", callback_data=f"admin_points:{uid}:-10"),
+            InlineKeyboardButton(text=f"➖50", callback_data=f"admin_points:{uid}:-50"),
+        ])
+    buttons.append([InlineKeyboardButton(text="🔄 刷新用户列表", callback_data="admin_users")])
+    buttons.append([InlineKeyboardButton(text="↩️ 返回设置中心", callback_data="settings_home")])
+    await callback.message.edit_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_points:"))
+async def admin_adjust_points(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    try:
+        _, uid_text, delta_text = callback.data.split(":")
+        target_id, delta = int(uid_text), int(delta_text)
+    except (ValueError, TypeError):
+        await callback.answer("参数无效", show_alert=True)
+        return
+    if delta not in (-50, -10, 10, 50):
+        await callback.answer("不支持的积分调整值", show_alert=True)
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT points FROM users WHERE user_id=?", (target_id,)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await callback.answer("用户不存在", show_alert=True)
+            return
+        new_points = max(0, int(row[0] or 0) + delta)
+        actual_delta = new_points - int(row[0] or 0)
+        await db.execute("UPDATE users SET points=? WHERE user_id=?", (new_points, target_id))
+        await db.commit()
+    await callback.answer(f"积分已调整：{actual_delta:+d}，余额 {new_points}")
+    await admin_users(callback)
+
+
 @dp.callback_query(F.data == "settings_start_points")
 async def settings_start_points(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -1003,10 +1080,24 @@ async def settings_set_value(callback: CallbackQuery):
     _, key, value = callback.data.split(":", 2)
     if key not in ("start_points", "buy_options", "random_count", "source_folder_price"):
         await callback.answer("不支持的设置项", show_alert=True); return
-    if key == "buy_options" and not all(x.strip().isdigit() for x in value.split(",")):
-        await callback.answer("档位格式不正确", show_alert=True); return
-    if key != "buy_options" and not value.isdigit():
-        await callback.answer("请输入数字", show_alert=True); return
+    if key == "buy_options":
+        options = [x.strip() for x in value.split(",")]
+        if (not options or len(options) > 10
+                or any(not x.isdigit() or not 1 <= int(x) <= 100000 for x in options)
+                or len(set(options)) != len(options)):
+            await callback.answer("档位须为 1–100000 的正整数，最多 10 档且不能重复", show_alert=True)
+            return
+        value = ",".join(options)
+    else:
+        if not value.isdigit():
+            await callback.answer("请输入数字", show_alert=True); return
+        number = int(value)
+        if key == "start_points" and not 0 <= number <= 1000000:
+            await callback.answer("新用户积分范围为 0–1000000", show_alert=True); return
+        if key == "random_count" and not 1 <= number <= 10:
+            await callback.answer("随机数量范围为 1–10", show_alert=True); return
+        if key == "source_folder_price" and not 0 <= number <= 1000000:
+            await callback.answer("解锁价格范围为 0–1000000", show_alert=True); return
     await set_config(key, value)
     await callback.message.edit_text(f"✅ 设置已保存\n\n{key} = {value}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ 返回设置中心", callback_data="settings_home")]]))
     await callback.answer("保存成功")
@@ -1016,9 +1107,17 @@ async def settings_set_value(callback: CallbackQuery):
 async def settings_set_checkin(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("无权限", show_alert=True); return
-    _, low, high = callback.data.split(":")
-    await set_config("checkin_min", low)
-    await set_config("checkin_max", high)
+    try:
+        _, low, high = callback.data.split(":")
+        low_n, high_n = int(low), int(high)
+    except (ValueError, TypeError):
+        await callback.answer("签到参数无效", show_alert=True)
+        return
+    if not (0 <= low_n <= high_n <= 100000):
+        await callback.answer("签到范围必须为 0–100000，且最低值不能高于最高值", show_alert=True)
+        return
+    await set_config("checkin_min", str(low_n))
+    await set_config("checkin_max", str(high_n))
     await callback.message.edit_text(f"✅ 签到奖励已设置为 {low}–{high} 积分。", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ 返回设置中心", callback_data="settings_home")]]))
     await callback.answer("保存成功")
 
