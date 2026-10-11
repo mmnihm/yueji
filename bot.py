@@ -398,33 +398,59 @@ async def send_source_folder_card(message: Message, folder):
         [InlineKeyboardButton(text="🎲 再随机一个文件夹", callback_data="source_random_again")],
     ])
 
-    # Only photo/video items can be combined in a Telegram album. Scan the whole
-    # folder so unsupported records at the beginning don't prevent usable items
-    # later in the list from being previewed. Keep at most three usable items.
+    if already_unlocked:
+        await message.answer(text, reply_markup=kb)
+        return True
+
+    # IMPORTANT: file_id values stored by the original bot belong to that bot and
+    # often cannot be reused by Yueji. Copy candidate messages temporarily to the
+    # admin's private chat, read the media file_id returned by THIS bot, then delete
+    # the temporary copies and send a real album to the user.
+    staging_chat_id = ADMIN_ID
+    staged_ids = []
     album = []
-    if not already_unlocked:
-        for _, _, file_type, stored_file_id, raw in candidates:
+    seen = set()
+    try:
+        for source_chat_id, message_id, file_type, stored_file_id, raw in candidates:
             kind = str(file_type or "").lower()
-            try:
-                payload = json.loads(raw or "{}")
-            except (TypeError, json.JSONDecodeError):
-                payload = {}
-            file_id = str(stored_file_id or payload.get("fileId") or payload.get("file_id") or "").strip()
-            if not file_id:
+            if not any(k in kind for k in ("photo", "image", "picture", "video")):
                 continue
-            if "photo" in kind or "image" in kind or "picture" in kind:
-                album.append(("photo", file_id))
-            elif "video" in kind:
-                album.append(("video", file_id))
+            if not source_chat_id or not message_id or (str(source_chat_id), int(message_id)) in seen:
+                continue
+            seen.add((str(source_chat_id), int(message_id)))
+            try:
+                copied = await bot.copy_message(
+                    chat_id=staging_chat_id,
+                    from_chat_id=source_chat_id,
+                    message_id=int(message_id),
+                    protect_content=True,
+                )
+            except Exception as exc:
+                print("Source preview staging copy error:", str(exc)[:240])
+                continue
+            staged_ids.append(copied.message_id)
+            media_kind = None
+            media_file_id = None
+            if getattr(copied, "photo", None):
+                media_kind = "photo"
+                media_file_id = copied.photo[-1].file_id
+            elif getattr(copied, "video", None):
+                media_kind = "video"
+                media_file_id = copied.video.file_id
+            if media_kind and media_file_id:
+                album.append((media_kind, media_file_id))
             if len(album) >= 3:
                 break
+    finally:
+        if staged_ids:
+            try:
+                await bot.delete_messages(chat_id=staging_chat_id, message_ids=staged_ids)
+            except Exception as exc:
+                print("Source preview staging cleanup error:", str(exc)[:200])
 
-    # Telegram requires at least two media items in an album. If only two
-    # usable items exist, send those two; if fewer than two exist, let the
-    # random-folder selector skip this folder and try another one.
     if len(album) >= 2:
         media = []
-        for index, (kind, file_id) in enumerate(album):
+        for index, (kind, file_id) in enumerate(album[:3]):
             caption = text if index == 0 else None
             if kind == "photo":
                 media.append(InputMediaPhoto(media=file_id, caption=caption))
@@ -455,12 +481,10 @@ async def choose_random_source_folder(message: Message):
     if not folders:
         return False
 
-    # Skip folders that have fewer than two usable photo/video file IDs, and
-    # continue to the next random folder instead of stopping at the first failure.
     for folder in folders:
         if await send_source_folder_card(message, folder):
             return True
-    await message.answer("📭 暂时没有找到至少包含两个可用图片/视频的文件夹，已跳过无法组成相册的文件夹。")
+    await message.answer("📭 暂时没有找到至少两个可预览的图片/视频资源。已跳过无法读取或无法组成相册的文件夹。请检查悦己机器人是否已加入原仓库，以及管理员是否已私聊启动悦己机器人。")
     return False
 
 
