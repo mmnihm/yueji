@@ -461,8 +461,9 @@ async def source_repository_keyboard():
 
 
 async def send_source_messages(chat_id: int, rows, preview: bool = False):
-    # Copy only the requested page. A normal unlock sends at most 10 source messages.
-    # Telegram copyMessages preserves media-group/album structure when the source messages are grouped.
+    # Preview sends exactly one source message. Unlock browsing sends at most 10
+    # source messages per click; Telegram copyMessages preserves album grouping
+    # when the source messages are grouped.
     grouped = {}
     for source_chat_id, message_id in rows:
         if not source_chat_id or not message_id:
@@ -472,9 +473,9 @@ async def send_source_messages(chat_id: int, rows, preview: bool = False):
     for source_chat_id, message_ids in grouped.items():
         message_ids = sorted(set(message_ids))
         if preview:
-            message_ids = message_ids[:3]
-        for start in range(0, len(message_ids), 10 if not preview else 3):
-            batch = message_ids[start:start + (10 if not preview else 3)]
+            message_ids = message_ids[:1]
+        for start in range(0, len(message_ids), 10 if not preview else 1):
+            batch = message_ids[start:start + (10 if not preview else 1)]
             try:
                 await bot.copy_messages(
                     chat_id=chat_id,
@@ -491,9 +492,11 @@ async def send_source_messages(chat_id: int, rows, preview: bool = False):
     return sent
 
 
-async def send_source_folder_card(message: Message, folder):
+async def send_source_folder_card(message: Message, folder, user_id: int | None = None):
     fid, name, total, images, videos, files = folder
-    points, _, _ = await get_or_create_user(message.from_user.id, message.from_user.username or "")
+    # On callback messages, message.from_user is the bot; use the actual clicker's ID.
+    user_id = int(user_id or message.from_user.id)
+    points, _, _ = await get_or_create_user(user_id, message.from_user.username or "")
     price_value = await get_config("source_folder_price", "10")
     price = max(0, int(price_value if price_value is not None else 10))
     async with aiosqlite.connect(DB_PATH) as db:
@@ -504,7 +507,7 @@ async def send_source_folder_card(message: Message, folder):
             candidates = await cur.fetchall()
         async with db.execute(
             "SELECT 1 FROM source_folder_unlocks WHERE user_id=? AND source_folder_id=?",
-            (message.from_user.id, str(fid)),
+            (user_id, str(fid)),
         ) as cur:
             already_unlocked = await cur.fetchone()
 
@@ -585,7 +588,7 @@ async def send_source_folder_card(message: Message, folder):
             continue
         seen.add(key)
         preview_rows.append((source_chat_id, int(message_id)))
-        if len(preview_rows) >= 3:
+        if len(preview_rows) >= 1:
             break
 
     await message.answer(text, reply_markup=kb)
@@ -597,34 +600,26 @@ async def send_source_folder_card(message: Message, folder):
     return True
 
 
-async def choose_random_source_folder(message: Message):
+async def choose_random_source_folder(message: Message, user_id: int | None = None):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT source_folder_id, name, item_count, image_count, video_count, file_count "
-            "FROM source_folders WHERE item_count > 0 ORDER BY RANDOM()"
+            "FROM source_folders WHERE item_count > 0 ORDER BY RANDOM() LIMIT 1"
         ) as cur:
-            folders = await cur.fetchall()
-    if not folders:
+            folder = await cur.fetchone()
+    if not folder:
         return False
 
-    # Respect the admin-configured random count. Clamp it defensively so a bad
-    # database value cannot cause an unexpectedly large burst of messages.
-    try:
-        requested = int(await get_config("random_count", "3") or 3)
-    except (TypeError, ValueError):
-        requested = 3
-    requested = max(1, min(requested, 10))
-    sent_cards = 0
-    for folder in folders[:requested]:
-        if await send_source_folder_card(message, folder):
-            sent_cards += 1
-    return sent_cards > 0
+    # Strict rule: one random click recommends exactly one folder card.
+    # The random_count setting is retained for compatibility but cannot create
+    # a burst of multiple folder recommendations.
+    return await send_source_folder_card(message, folder, user_id=user_id)
 
 
 @dp.callback_query(F.data == "source_random_again")
 async def source_random_again(callback: CallbackQuery):
     await callback.answer()
-    if not await choose_random_source_folder(callback.message):
+    if not await choose_random_source_folder(callback.message, user_id=callback.from_user.id):
         await callback.message.answer("📭 暂时没有已同步的资源文件夹，请稍后再试。")
 
 
