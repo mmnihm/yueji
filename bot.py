@@ -1247,6 +1247,76 @@ async def settings_source_price(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data == "settings_browse_limit")
+async def settings_browse_limit(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    minutes = await get_config("browse_minutes", "5")
+    scope = await get_config("browse_scope", "all")
+    admin_exempt = await get_config("browse_admin_exempt", "1")
+    duration_label = "不限时" if minutes == "0" else f"{minutes} 分钟"
+    scope_label = "全部资源" if scope == "all" else "仅视频"
+    admin_label = "管理员免限时" if admin_exempt == "1" else "管理员也限时"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="3 分钟", callback_data="cfgset:browse_minutes:3"),
+            InlineKeyboardButton(text="5 分钟", callback_data="cfgset:browse_minutes:5"),
+            InlineKeyboardButton(text="10 分钟", callback_data="cfgset:browse_minutes:10"),
+        ],
+        [
+            InlineKeyboardButton(text="不限时", callback_data="cfgset:browse_minutes:0"),
+            InlineKeyboardButton(text="自定义分钟", callback_data="settings_browse_custom"),
+        ],
+        [
+            InlineKeyboardButton(text="限制全部资源", callback_data="browse_config:browse_scope:all"),
+            InlineKeyboardButton(text="只限制视频", callback_data="browse_config:browse_scope:videos"),
+        ],
+        [InlineKeyboardButton(
+            text=("管理员免限时：开启" if admin_exempt == "1" else "管理员免限时：关闭"),
+            callback_data=f"browse_config:browse_admin_exempt:{'0' if admin_exempt == '1' else '1'}",
+        )],
+        [InlineKeyboardButton(text="↩️ 返回设置中心", callback_data="settings_home")],
+    ])
+    await callback.message.edit_text(
+        "⏱️ 解锁后浏览时长设置\n━━━━━━━━━━━━━━\n"
+        f"当前时长：{duration_label}\n限制范围：{scope_label}\n管理员：{admin_label}\n\n"
+        "计时从用户点击「开始浏览资源」时开始。到期后阻止新的受限资源发送，已发送的消息无法撤回。"
+        "\n注意：新设置只影响之后开始的浏览会话。",
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settings_browse_custom")
+async def settings_browse_custom(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    pending_config[callback.from_user.id] = "browse_minutes"
+    await callback.message.answer("请发送浏览时长分钟数（1–1440；发送 0 表示不限时）。发送「取消设置」可取消。")
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("browse_config:"))
+async def settings_browse_config(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    try:
+        _, key, value = callback.data.split(":", 2)
+    except ValueError:
+        await callback.answer("设置参数无效", show_alert=True)
+        return
+    normalized, error = await validate_config_value(key, value)
+    if error:
+        await callback.answer(error, show_alert=True)
+        return
+    await set_config(key, normalized)
+    await callback.answer("设置已保存")
+    await settings_browse_limit(callback)
+
+
 @dp.callback_query(F.data == "settings_random_count")
 async def settings_random_count(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -1263,26 +1333,13 @@ async def settings_set_value(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("无权限", show_alert=True); return
     _, key, value = callback.data.split(":", 2)
-    if key not in ("start_points", "buy_options", "random_count", "source_folder_price"):
+    if key not in ("start_points", "buy_options", "random_count", "source_folder_price", "browse_minutes"):
         await callback.answer("不支持的设置项", show_alert=True); return
-    if key == "buy_options":
-        options = [x.strip() for x in value.split(",")]
-        if (not options or len(options) > 10
-                or any(not x.isdigit() or not 1 <= int(x) <= 100000 for x in options)
-                or len(set(options)) != len(options)):
-            await callback.answer("档位须为 1–100000 的正整数，最多 10 档且不能重复", show_alert=True)
-            return
-        value = ",".join(options)
-    else:
-        if not value.isdigit():
-            await callback.answer("请输入数字", show_alert=True); return
-        number = int(value)
-        if key == "start_points" and not 0 <= number <= 1000000:
-            await callback.answer("新用户积分范围为 0–1000000", show_alert=True); return
-        if key == "random_count" and not 1 <= number <= 10:
-            await callback.answer("随机数量范围为 1–10", show_alert=True); return
-        if key == "source_folder_price" and not 0 <= number <= 1000000:
-            await callback.answer("解锁价格范围为 0–1000000", show_alert=True); return
+    normalized, error = await validate_config_value(key, value)
+    if error:
+        await callback.answer(error, show_alert=True)
+        return
+    value = normalized
     await set_config(key, value)
     await callback.message.edit_text(f"✅ 设置已保存\n\n{key} = {value}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ 返回设置中心", callback_data="settings_home")]]))
     await callback.answer("保存成功")
@@ -1651,6 +1708,15 @@ async def handle_pending_admin_text(message: Message):
     if message.text == "取消设置":
         pending_config.pop(user_id, None)
         await message.answer("已取消本次设置。")
+        return
+    if key == "browse_minutes":
+        normalized, error = await validate_config_value("browse_minutes", message.text or "")
+        if error:
+            await message.answer(error + "\n请重新发送分钟数，或发送「取消设置」。")
+            return
+        await set_config("browse_minutes", normalized)
+        pending_config.pop(user_id, None)
+        await message.answer("✅ 浏览时长已保存：" + ("不限时" if normalized == "0" else normalized + " 分钟"))
         return
     if key == "source_repo_id":
         repo_id = (message.text or "").strip()
