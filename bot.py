@@ -146,11 +146,26 @@ async def set_config(key: str, value: str):
 
 
 def source_mysql_settings():
-    # Prefer Yueji's own environment; if absent, read the existing bot's local .env
-    # without printing credentials or modifying the original bot.
+    # Read-only integration: first look at the existing bot's .env and PM2 saved
+    # environment, then let Yueji's own environment override them. Never log secrets.
     cfg = {}
     try:
         cfg.update({k: v for k, v in dotenv_values("/root/bot/.env").items() if v})
+    except Exception:
+        pass
+    try:
+        with open("/root/.pm2/dump.pm2", "r", encoding="utf-8") as handle:
+            saved_apps = json.load(handle)
+        if isinstance(saved_apps, list):
+            for app in saved_apps:
+                name = str(app.get("name") or "")
+                script = str((app.get("pm2_env") or {}).get("pm_exec_path") or "")
+                if name == "bot" or "/root/bot/" in script:
+                    env = (app.get("pm2_env") or {}).get("env") or {}
+                    for key in ("DATABASE_URL", "DB_HOST", "DB_PORT", "DB_USER", "DB_PASSWORD", "DB_NAME"):
+                        if env.get(key):
+                            cfg[key] = env[key]
+                    break
     except Exception:
         pass
     cfg.update({k: v for k, v in os.environ.items() if v})
