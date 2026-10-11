@@ -1639,6 +1639,7 @@ async def my_info(message: Message):
 @dp.message(F.text == "每日签到")
 async def daily_checkin(message: Message):
     user_id = message.from_user.id
+    await get_or_create_user(user_id, message.from_user.username or "")
     today = date.today().isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
@@ -1728,18 +1729,35 @@ async def send_resource_files(chat_id: int, file_ids_json: str):
 
 @dp.callback_query(F.data.startswith("unlock_"))
 async def unlock_callback(callback: CallbackQuery):
-    rid = int(callback.data.split("_")[1])
+    try:
+        rid = int(callback.data.split("_", 1)[1])
+    except (ValueError, IndexError):
+        await callback.answer("资源编号无效", show_alert=True)
+        return
     user_id = callback.from_user.id
+    await get_or_create_user(user_id, callback.from_user.username or "")
     async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
         async with db.execute("SELECT price, file_ids FROM resources WHERE id = ?", (rid,)) as cursor:
             row = await cursor.fetchone()
         if not row:
-            await callback.answer("资源不存在")
+            await db.rollback()
+            await callback.answer("资源不存在", show_alert=True)
+            return
+        async with db.execute(
+            "SELECT 1 FROM unlocks WHERE user_id=? AND resource_id=?",
+            (user_id, rid),
+        ) as cursor:
+            existing = await cursor.fetchone()
+        if existing:
+            await db.rollback()
+            await callback.answer("你已解锁过该资源，不会重复扣积分。", show_alert=True)
             return
         price, file_ids = row
         async with db.execute("SELECT points FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            points = (await cursor.fetchone())[0]
-        if points < price:
+            user_row = await cursor.fetchone()
+        if not user_row or int(user_row[0] or 0) < int(price or 0):
+            await db.rollback()
             await callback.answer("积分不足", show_alert=True)
             return
         await db.execute(
@@ -1747,12 +1765,15 @@ async def unlock_callback(callback: CallbackQuery):
             (price, price, user_id),
         )
         await db.execute(
-            "INSERT OR IGNORE INTO unlocks (user_id, resource_id, unlocked_at) VALUES (?, ?, datetime('now'))",
+            "INSERT INTO unlocks (user_id, resource_id, unlocked_at) VALUES (?, ?, datetime('now'))",
             (user_id, rid),
         )
         await db.commit()
     await callback.answer("解锁成功")
-    await callback.message.edit_reply_markup(reply_markup=None)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
     await callback.message.answer("🎉 解锁成功！\n━━━━━━━━━━━━━━\n📦 正在为你发送资源，请稍候…")
     await send_resource_files(callback.message.chat.id, file_ids)
 
@@ -1802,6 +1823,50 @@ async def handle_pending_admin_text(message: Message):
     if message.text == "取消设置":
         pending_config.pop(user_id, None)
         await message.answer("已取消本次设置。")
+        return
+    if key == "admin_user_search":
+        query = (message.text or "").strip().lstrip("@")
+        if not query or len(query) > 64:
+            await message.answer("请输入有效的用户 ID 或用户名（最多 64 个字符）。")
+            return
+        admin_user_search_queries[user_id] = query
+        pending_config.pop(user_id, None)
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                """SELECT user_id, username, points, banned FROM users
+                   WHERE CAST(user_id AS TEXT)=? OR username LIKE ?
+                   ORDER BY rowid DESC LIMIT 10""",
+                (query, f"%{query}%"),
+            ) as cur:
+                rows = await cur.fetchall()
+            async with db.execute(
+                """SELECT COUNT(*) FROM users
+                   WHERE CAST(user_id AS TEXT)=? OR username LIKE ?""",
+                (query, f"%{query}%"),
+            ) as cur:
+                count_row = await cur.fetchone()
+        lines = [
+            "🔍 用户搜索结果",
+            "━━━━━━━━━━━━━━",
+            f"匹配用户：{int(count_row[0] or 0)}（搜索：{query}）",
+            "最多显示 10 位，可增减积分或封禁/解封。",
+            "",
+        ]
+        buttons = []
+        for uid, username, points, banned in rows:
+            label = (("@" + username) if username else str(uid))[:24]
+            lines.append(f"• {label}（ID {uid}）：{int(points or 0)} 积分｜{'🚫 已封禁' if banned else '🟢 正常'}")
+            buttons.append([
+                InlineKeyboardButton(text="➕10", callback_data=f"admin_points:{uid}:10"),
+                InlineKeyboardButton(text="➕50", callback_data=f"admin_points:{uid}:50"),
+                InlineKeyboardButton(text="➖10", callback_data=f"admin_points:{uid}:-10"),
+                InlineKeyboardButton(text=("🔓 解封" if banned else "🚫 封禁"), callback_data=f"admin_ban:{uid}:{0 if banned else 1}"),
+            ])
+        if not rows:
+            lines.append("没有找到匹配用户。")
+        buttons.append([InlineKeyboardButton(text="🔍 重新搜索", callback_data="admin_user_search")])
+        buttons.append([InlineKeyboardButton(text="📋 最近用户", callback_data="admin_users_clear_search")])
+        await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
         return
     if key == "browse_minutes":
         normalized, error = await validate_config_value("browse_minutes", message.text or "")
