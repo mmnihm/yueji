@@ -18,6 +18,8 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     CallbackQuery,
+    InputMediaPhoto,
+    InputMediaVideo,
 )
 from dotenv import load_dotenv, dotenv_values
 
@@ -370,7 +372,7 @@ async def send_source_folder_card(message: Message, folder):
     price = int(await get_config("source_folder_price", "10") or 10)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT chat_id, message_id, file_type FROM source_resources WHERE folder_id=? ORDER BY message_id LIMIT 20",
+            "SELECT chat_id, message_id, file_type, data FROM source_resources WHERE folder_id=? ORDER BY message_id LIMIT 20",
             (str(fid),),
         ) as cur:
             candidates = await cur.fetchall()
@@ -390,29 +392,45 @@ async def send_source_folder_card(message: Message, folder):
         [InlineKeyboardButton(text=f"🔓 解锁整个文件夹（{price} 积分）", callback_data=f"source_unlock:{fid}")],
         [InlineKeyboardButton(text="🎲 再随机一个文件夹", callback_data="source_random_again")],
     ])
-    preview_rows = [(chat_id, mid) for chat_id, mid, _ in candidates[:3]]
-    image_row = next(
-        ((chat_id, mid) for chat_id, mid, file_type in candidates
-         if any(word in str(file_type or "").lower() for word in ("photo", "image", "picture"))),
-        None,
-    )
-    # Attach the folder description and buttons directly to a copied image.
-    if image_row and not already_unlocked:
-        try:
-            await bot.copy_message(
-                chat_id=message.chat.id,
-                from_chat_id=str(image_row[0]),
-                message_id=int(image_row[1]),
-                caption=text,
-                reply_markup=kb,
-                protect_content=True,
-            )
-            preview_rows = [row for row in preview_rows if row != image_row][:2]
-            if preview_rows:
-                await send_source_messages(message.chat.id, preview_rows, preview=True)
-            return
-        except Exception as exc:
-            print("Source image caption preview error:", str(exc)[:300])
+    preview_rows = [(chat_id, mid) for chat_id, mid, _, _ in candidates[:3]]
+    # If the source records contain reusable Telegram file IDs, combine up to three
+    # photo/video previews into one album. Keep the descriptive text and buttons below it.
+    if not already_unlocked and len(preview_rows) >= 2:
+        album = []
+        for chat_id, mid, file_type, raw in candidates[:3]:
+            kind = str(file_type or "").lower()
+            try:
+                payload = json.loads(raw or "{}")
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+            file_id = str(payload.get("fileId") or payload.get("file_id") or "").strip()
+            if not file_id:
+                album = []
+                break
+            if "photo" in kind or "image" in kind or "picture" in kind:
+                album.append(InputMediaPhoto(media=file_id))
+            elif "video" in kind:
+                album.append(InputMediaVideo(media=file_id))
+            else:
+                # Telegram media albums do not support animations/documents as album items.
+                album = []
+                break
+        if 2 <= len(album) <= 3:
+            try:
+                await bot.send_media_group(
+                    chat_id=message.chat.id,
+                    media=album,
+                    protect_content=True,
+                )
+                await message.answer(text, reply_markup=kb)
+                return
+            except Exception as exc:
+                print("Source preview album error:", str(exc)[:300])
+                # Different bots may not be able to reuse the source bot's file_id.
+                # Fall back to copying the original messages rather than losing the preview.
+
+    # Fallback: copy the original messages. This preserves an album only if the source
+    # messages were already grouped together in Telegram.
     await message.answer(text, reply_markup=kb)
     if preview_rows and not already_unlocked:
         try:
@@ -424,7 +442,6 @@ async def send_source_folder_card(message: Message, folder):
                 pass
             await message.answer("⚠️ 预览发送失败，暂时无法解锁这个文件夹。请管理员检查悦己机器人是否已加入原仓库并有读取权限。")
             print("Source preview error:", str(exc)[:300])
-
 
 async def choose_random_source_folder(message: Message):
     async with aiosqlite.connect(DB_PATH) as db:
