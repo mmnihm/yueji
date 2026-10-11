@@ -572,32 +572,33 @@ async def send_source_folder_card(message: Message, folder, user_id: int | None 
             # 最后仍会回退到按源消息 ID 复制，避免随机功能整体失效。
             print("Random folder single-media preview failed:", str(exc)[:220])
 
-    # 回退路径：没有可直接发送的单条媒体时，保留原有说明卡片和源消息复制方式。
-    if already_unlocked:
-        await message.answer(text, reply_markup=kb)
-        return True
-
-    preview_rows = []
-    seen = set()
+    # Fallback: copy exactly one real source media message and attach the folder
+    # description/buttons as its caption. Do not send a separate text card first.
+    # Even when the stored file_id is unusable, the copied media and card stay together.
     for source_chat_id, message_id, file_type, stored_file_id, raw in candidates:
         kind = str(file_type or "").lower()
-        if not any(k in kind for k in ("photo", "image", "picture", "video")):
+        if not any(token in kind for token in ("photo", "image", "picture", "video", "animation", "document", "file")):
             continue
-        key = (str(source_chat_id), int(message_id or 0))
-        if not source_chat_id or not message_id or key in seen:
+        if not source_chat_id or not message_id:
             continue
-        seen.add(key)
-        preview_rows.append((source_chat_id, int(message_id)))
-        if len(preview_rows) >= 1:
-            break
-
-    await message.answer(text, reply_markup=kb)
-    if preview_rows:
         try:
-            await send_source_messages(message.chat.id, preview_rows, preview=True)
+            await bot.copy_message(
+                chat_id=message.chat.id,
+                from_chat_id=source_chat_id,
+                message_id=int(message_id),
+                caption=text,
+                reply_markup=kb,
+                protect_content=True,
+            )
+            return True
         except Exception as exc:
-            print("Source preview copy error:", str(exc)[:300])
-    return True
+            print("Random folder captioned copy preview failed:", str(exc)[:220])
+
+    # If Telegram cannot copy any real media, avoid pretending a detached text
+    # message is a media card; explain the preview is temporarily unavailable.
+    await message.answer(
+        "⚠️ 这个文件夹暂时无法生成带说明的媒体卡片，请稍后再试或联系管理员检查仓库权限。"
+    )
 
 
 async def choose_random_source_folder(message: Message, user_id: int | None = None):
