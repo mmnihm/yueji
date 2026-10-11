@@ -676,7 +676,7 @@ async def settings_center(message: Message):
         [InlineKeyboardButton(text="🎁 新用户赠送积分", callback_data="settings_start_points")],
         [InlineKeyboardButton(text="📅 每日签到奖励", callback_data="settings_checkin")],
         [InlineKeyboardButton(text="🛍️ 积分购买档位", callback_data="settings_buy_options")],
-        [InlineKeyboardButton(text="🎲 随机资源数量", callback_data="settings_random_count")],
+        [InlineKeyboardButton(text="🎲 随机文件夹数量", callback_data="settings_random_count")],
         [InlineKeyboardButton(text="📦 文件夹解锁价格", callback_data="settings_source_price")],
         [InlineKeyboardButton(text="✏️ 修改欢迎文案", callback_data="settings_text:welcome_text"), InlineKeyboardButton(text="💡 修改帮助文案", callback_data="settings_text:help_text")],
         [InlineKeyboardButton(text="🖼️ 设置欢迎图片", callback_data="settings_welcome_image")],
@@ -697,7 +697,7 @@ async def settings_home_callback(callback: CallbackQuery):
         [InlineKeyboardButton(text="🎁 新用户赠送积分", callback_data="settings_start_points")],
         [InlineKeyboardButton(text="📅 每日签到奖励", callback_data="settings_checkin")],
         [InlineKeyboardButton(text="🛍️ 积分购买档位", callback_data="settings_buy_options")],
-        [InlineKeyboardButton(text="🎲 随机资源数量", callback_data="settings_random_count")],
+        [InlineKeyboardButton(text="🎲 随机文件夹数量", callback_data="settings_random_count")],
         [InlineKeyboardButton(text="📦 文件夹解锁价格", callback_data="settings_source_price")],
         [InlineKeyboardButton(text="✏️ 修改欢迎文案", callback_data="settings_text:welcome_text"), InlineKeyboardButton(text="💡 修改帮助文案", callback_data="settings_text:help_text")],
         [InlineKeyboardButton(text="🖼️ 设置欢迎图片", callback_data="settings_welcome_image")],
@@ -1070,7 +1070,7 @@ async def settings_random_count(callback: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text=f"{n} 个", callback_data=f"cfgset:random_count:{n}") for n in (1, 3, 5, 10)
     ], [InlineKeyboardButton(text="↩️ 返回设置", callback_data="settings_home")]])
-    await callback.message.edit_text("🎲 请选择每次随机推送的资源数量：", reply_markup=kb)
+    await callback.message.edit_text("🎲 请选择每次随机推送的文件夹数量（1–10）：", reply_markup=kb)
     await callback.answer()
 
 
