@@ -10,7 +10,7 @@ from urllib.parse import urlparse, unquote
 import aiomysql
 
 import aiosqlite
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
     Message,
@@ -789,7 +789,28 @@ async def get_or_create_user(user_id: int, username: str):
 
 
 def is_admin(user_id: int) -> bool:
-    return ADMIN_ID and user_id == ADMIN_ID
+    return bool(ADMIN_ID and user_id == ADMIN_ID)
+
+
+class UserAccessMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if not user or is_admin(user.id):
+            return await handler(event, data)
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT banned FROM users WHERE user_id=?", (user.id,)) as cur:
+                row = await cur.fetchone()
+        if row and int(row[0] or 0):
+            if isinstance(event, CallbackQuery):
+                await event.answer("你的账号当前无法使用该机器人，请联系管理员。", show_alert=True)
+            elif isinstance(event, Message):
+                await event.answer("你的账号当前无法使用该机器人，请联系管理员。")
+            return None
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(UserAccessMiddleware())
+dp.callback_query.outer_middleware(UserAccessMiddleware())
 
 
 def main_keyboard(user_id: int = 0):
@@ -1248,7 +1269,7 @@ async def settings_source_price(callback: CallbackQuery):
 
 
 @dp.callback_query(F.data == "settings_browse_limit")
-async def settings_browse_limit(callback: CallbackQuery):
+async def settings_browse_limit(callback: CallbackQuery, answer_callback: bool = True):
     if not is_admin(callback.from_user.id):
         await callback.answer("无权限", show_alert=True)
         return
@@ -1285,7 +1306,8 @@ async def settings_browse_limit(callback: CallbackQuery):
         "\n注意：新设置只影响之后开始的浏览会话。",
         reply_markup=kb,
     )
-    await callback.answer()
+    if answer_callback:
+        await callback.answer()
 
 
 @dp.callback_query(F.data == "settings_browse_custom")
@@ -1314,7 +1336,7 @@ async def settings_browse_config(callback: CallbackQuery):
         return
     await set_config(key, normalized)
     await callback.answer("设置已保存")
-    await settings_browse_limit(callback)
+    await settings_browse_limit(callback, answer_callback=False)
 
 
 @dp.callback_query(F.data == "settings_random_count")
@@ -1452,6 +1474,7 @@ async def cmd_del(message: Message):
 
 upload_state = {}
 pending_config = {}
+admin_user_search_queries = {}
 
 
 @dp.message(F.text.contains("|") & F.from_user.id == ADMIN_ID)
