@@ -402,73 +402,48 @@ async def send_source_folder_card(message: Message, folder):
         await message.answer(text, reply_markup=kb)
         return True
 
-    # IMPORTANT: file_id values stored by the original bot belong to that bot and
-    # often cannot be reused by Yueji. Copy candidate messages temporarily to the
-    # admin's private chat, read the media file_id returned by THIS bot, then delete
-    # the temporary copies and send a real album to the user.
-    staging_chat_id = ADMIN_ID
-    staged_ids = []
+    # Do not copy each source message to the admin chat to probe its media:
+    # Bot API copy_message returns MessageId, not a Message with photo/video fields.
+    # Probing this way caused every candidate to be copied repeatedly. Only use
+    # file IDs already stored in the source DB, and skip this folder if none work.
     album = []
-    seen = set()
-    try:
-        for source_chat_id, message_id, file_type, stored_file_id, raw in candidates:
-            kind = str(file_type or "").lower()
-            if not any(k in kind for k in ("photo", "image", "picture", "video")):
-                continue
-            if not source_chat_id or not message_id or (str(source_chat_id), int(message_id)) in seen:
-                continue
-            seen.add((str(source_chat_id), int(message_id)))
-            try:
-                copied = await bot.copy_message(
-                    chat_id=staging_chat_id,
-                    from_chat_id=source_chat_id,
-                    message_id=int(message_id),
-                    protect_content=True,
-                )
-            except Exception as exc:
-                print("Source preview staging copy error:", str(exc)[:240])
-                continue
-            staged_ids.append(copied.message_id)
-            media_kind = None
-            media_file_id = None
-            if getattr(copied, "photo", None):
-                media_kind = "photo"
-                media_file_id = copied.photo[-1].file_id
-            elif getattr(copied, "video", None):
-                media_kind = "video"
-                media_file_id = copied.video.file_id
-            if media_kind and media_file_id:
-                album.append((media_kind, media_file_id))
-            if len(album) >= 3:
-                break
-    finally:
-        if staged_ids:
-            try:
-                await bot.delete_messages(chat_id=staging_chat_id, message_ids=staged_ids)
-            except Exception as exc:
-                print("Source preview staging cleanup error:", str(exc)[:200])
-
-    if len(album) >= 2:
-        media = []
-        for index, (kind, file_id) in enumerate(album[:3]):
-            caption = text if index == 0 else None
-            if kind == "photo":
-                media.append(InputMediaPhoto(media=file_id, caption=caption))
-            else:
-                media.append(InputMediaVideo(media=file_id, caption=caption))
+    for _, _, file_type, stored_file_id, raw in candidates:
+        kind = str(file_type or "").lower()
         try:
-            await bot.send_media_group(
-                chat_id=message.chat.id,
-                media=media,
-                protect_content=True,
-            )
-            await message.answer("👇 选择操作：", reply_markup=kb)
-            return True
-        except Exception as exc:
-            print("Source preview album error:", str(exc)[:300])
-            return False
+            payload = json.loads(raw or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        file_id = str(stored_file_id or payload.get("fileId") or payload.get("file_id") or "").strip()
+        if not file_id:
+            continue
+        if "photo" in kind or "image" in kind or "picture" in kind:
+            album.append(("photo", file_id))
+        elif "video" in kind:
+            album.append(("video", file_id))
+        if len(album) >= 3:
+            break
 
-    return False
+    if len(album) < 2:
+        return False
+
+    media = []
+    for index, (kind, file_id) in enumerate(album[:3]):
+        caption = text if index == 0 else None
+        if kind == "photo":
+            media.append(InputMediaPhoto(media=file_id, caption=caption))
+        else:
+            media.append(InputMediaVideo(media=file_id, caption=caption))
+    try:
+        await bot.send_media_group(
+            chat_id=message.chat.id,
+            media=media,
+            protect_content=True,
+        )
+        await message.answer("👇 选择操作：", reply_markup=kb)
+        return True
+    except Exception as exc:
+        print("Source preview album error:", str(exc)[:300])
+        return False
 
 
 async def choose_random_source_folder(message: Message):
@@ -484,7 +459,6 @@ async def choose_random_source_folder(message: Message):
     for folder in folders:
         if await send_source_folder_card(message, folder):
             return True
-    await message.answer("📭 暂时没有找到至少两个可预览的图片/视频资源。已跳过无法读取或无法组成相册的文件夹。请检查悦己机器人是否已加入原仓库，以及管理员是否已私聊启动悦己机器人。")
     return False
 
 
