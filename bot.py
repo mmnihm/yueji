@@ -4,6 +4,7 @@ import random
 import secrets
 import json
 from datetime import date
+from datetime import datetime
 from urllib.parse import urlparse, unquote
 
 import aiomysql
@@ -46,6 +47,9 @@ DEFAULT_CONFIG = {
     "welcome_image_file_id": "",
     "source_repo_id": "",
     "source_folder_price": "10",
+    "browse_minutes": "5",
+    "browse_scope": "all",
+    "browse_admin_exempt": "1",
 }
 
 
@@ -57,9 +61,14 @@ async def init_db():
                 username TEXT,
                 points INTEGER DEFAULT 10,
                 total_spent INTEGER DEFAULT 0,
-                unlocked_count INTEGER DEFAULT 0
+                unlocked_count INTEGER DEFAULT 0,
+                banned INTEGER NOT NULL DEFAULT 0
             )
         """)
+        async with db.execute("PRAGMA table_info(users)") as cur:
+            user_columns = {row[1] for row in await cur.fetchall()}
+        if "banned" not in user_columns:
+            await db.execute("ALTER TABLE users ADD COLUMN banned INTEGER NOT NULL DEFAULT 0")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS resources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -143,6 +152,15 @@ async def init_db():
                 PRIMARY KEY (user_id, source_folder_id)
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS source_browse_sessions (
+                user_id INTEGER NOT NULL,
+                source_folder_id TEXT NOT NULL,
+                started_at TEXT NOT NULL DEFAULT (datetime('now')),
+                expires_at TEXT,
+                PRIMARY KEY (user_id, source_folder_id)
+            )
+        """)
         await db.commit()
 
 
@@ -159,6 +177,62 @@ async def set_config(key: str, value: str):
             "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)", (key, value)
         )
         await db.commit()
+
+
+async def validate_config_value(key: str, value: str):
+    value = str(value).strip()
+    numeric_ranges = {
+        "start_points": (0, 1000000),
+        "source_folder_price": (0, 1000000),
+        "random_count": (1, 10),
+        "browse_minutes": (0, 1440),
+        "checkin_min": (0, 100000),
+        "checkin_max": (0, 100000),
+    }
+    if key == "buy_options":
+        options = [part.strip() for part in value.split(",")]
+        if (not options or len(options) > 10
+                or any(not part.isdigit() or not 1 <= int(part) <= 100000 for part in options)
+                or len(set(options)) != len(options)):
+            return None, "积分档位须为 1–100000 的正整数，最多 10 档且不能重复。"
+        return ",".join(options), None
+    if key in numeric_ranges:
+        if not value.isdigit():
+            return None, "该设置必须填写数字。"
+        number = int(value)
+        low, high = numeric_ranges[key]
+        if not low <= number <= high:
+            return None, f"数值范围应为 {low}–{high}。"
+        if key == "checkin_min":
+            high_value = int(await get_config("checkin_max", "3") or 0)
+            if number > high_value:
+                return None, "签到最低奖励不能高于当前最高奖励。"
+        if key == "checkin_max":
+            low_value = int(await get_config("checkin_min", "1") or 0)
+            if number < low_value:
+                return None, "签到最高奖励不能低于当前最低奖励。"
+        return str(number), None
+    if key == "browse_scope":
+        if value not in ("all", "videos"):
+            return None, "浏览范围只能设置为全部资源或视频。"
+        return value, None
+    if key == "browse_admin_exempt":
+        if value not in ("0", "1"):
+            return None, "管理员限时选项无效。"
+        return value, None
+    if key == "source_repo_id":
+        if not value.lstrip("-").isdigit() or len(value) < 5:
+            return None, "频道 ID 格式不正确，请发送数字频道 ID。"
+        return value, None
+    if key in ("welcome_text", "help_text"):
+        if not value or len(value) > 3500:
+            return None, "文案不能为空，且请控制在 3500 字以内。"
+        return value, None
+    if key == "welcome_image_file_id":
+        return None, "请通过欢迎图片按钮发送图片，不支持手动输入此配置。"
+    if key not in DEFAULT_CONFIG:
+        return None, "无效配置键。"
+    return value, None
 
 
 def source_mysql_settings():
@@ -374,7 +448,8 @@ async def send_source_messages(chat_id: int, rows, preview: bool = False):
 async def send_source_folder_card(message: Message, folder):
     fid, name, total, images, videos, files = folder
     points, _, _ = await get_or_create_user(message.from_user.id, message.from_user.username or "")
-    price = int(await get_config("source_folder_price", "10") or 10)
+    price_value = await get_config("source_folder_price", "10")
+    price = max(0, int(price_value if price_value is not None else 10))
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT chat_id, message_id, file_type, file_id, data FROM source_resources WHERE folder_id=? ORDER BY message_id",
@@ -492,7 +567,8 @@ async def source_folder_unlock(callback: CallbackQuery):
             return
         async with db.execute("SELECT points FROM users WHERE user_id=?", (user_id,)) as cur:
             user_row = await cur.fetchone()
-        price = max(0, int(await get_config("source_folder_price", "10") or 10))
+        price_value = await get_config("source_folder_price", "10")
+        price = max(0, int(price_value if price_value is not None else 10))
         if not user_row or int(user_row[0]) < price:
             await db.rollback()
             await callback.answer(f"积分不足，需要 {price} 积分。", show_alert=True)
@@ -661,11 +737,12 @@ async def cmd_set(message: Message):
         await message.answer("用法：/set 键 值")
         return
     key, value = args[1], args[2]
-    if key not in DEFAULT_CONFIG:
-        await message.answer("无效配置键")
+    normalized, error = await validate_config_value(key, value)
+    if error:
+        await message.answer(error)
         return
-    await set_config(key, value)
-    await message.answer(f"已更新 {key} = {value}")
+    await set_config(key, normalized)
+    await message.answer(f"✅ 已更新 {key} = {normalized}")
 
 
 @dp.message(F.text == "⚙️ 设置中心")
@@ -678,6 +755,7 @@ async def settings_center(message: Message):
         [InlineKeyboardButton(text="🛍️ 积分购买档位", callback_data="settings_buy_options")],
         [InlineKeyboardButton(text="🎲 随机文件夹数量", callback_data="settings_random_count")],
         [InlineKeyboardButton(text="📦 文件夹解锁价格", callback_data="settings_source_price")],
+        [InlineKeyboardButton(text="⏱️ 解锁后浏览时长", callback_data="settings_browse_limit")],
         [InlineKeyboardButton(text="✏️ 修改欢迎文案", callback_data="settings_text:welcome_text"), InlineKeyboardButton(text="💡 修改帮助文案", callback_data="settings_text:help_text")],
         [InlineKeyboardButton(text="🖼️ 设置欢迎图片", callback_data="settings_welcome_image")],
         [InlineKeyboardButton(text="🎟️ 兑换码管理", callback_data="codes_manage")],
@@ -699,6 +777,7 @@ async def settings_home_callback(callback: CallbackQuery):
         [InlineKeyboardButton(text="🛍️ 积分购买档位", callback_data="settings_buy_options")],
         [InlineKeyboardButton(text="🎲 随机文件夹数量", callback_data="settings_random_count")],
         [InlineKeyboardButton(text="📦 文件夹解锁价格", callback_data="settings_source_price")],
+        [InlineKeyboardButton(text="⏱️ 解锁后浏览时长", callback_data="settings_browse_limit")],
         [InlineKeyboardButton(text="✏️ 修改欢迎文案", callback_data="settings_text:welcome_text"), InlineKeyboardButton(text="💡 修改帮助文案", callback_data="settings_text:help_text")],
         [InlineKeyboardButton(text="🖼️ 设置欢迎图片", callback_data="settings_welcome_image")],
         [InlineKeyboardButton(text="🎟️ 兑换码管理", callback_data="codes_manage")],
