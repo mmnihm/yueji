@@ -536,6 +536,86 @@ async def source_random_again(callback: CallbackQuery):
         await callback.message.answer("📭 暂时没有已同步的资源文件夹，请稍后再试。")
 
 
+async def create_browse_session(user_id: int, fid: str):
+    try:
+        minutes = max(0, min(1440, int(await get_config("browse_minutes", "5") or 0)))
+    except (TypeError, ValueError):
+        minutes = 5
+    admin_exempt = (await get_config("browse_admin_exempt", "1")) == "1" and is_admin(user_id)
+    expires_at = None
+    if minutes > 0 and not admin_exempt:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """INSERT INTO source_browse_sessions (user_id, source_folder_id, started_at, expires_at)
+                   VALUES (?, ?, datetime('now'), datetime('now', ?))
+                   ON CONFLICT(user_id, source_folder_id) DO NOTHING""",
+                (user_id, fid, f"+{minutes} minutes"),
+            )
+            await db.commit()
+    else:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute(
+                """INSERT INTO source_browse_sessions (user_id, source_folder_id, started_at, expires_at)
+                   VALUES (?, ?, datetime('now'), NULL)
+                   ON CONFLICT(user_id, source_folder_id) DO NOTHING""",
+                (user_id, fid),
+            )
+            await db.commit()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT started_at, expires_at FROM source_browse_sessions WHERE user_id=? AND source_folder_id=?",
+            (user_id, fid),
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def browse_session_expired(user_id: int, fid: str):
+    try:
+        minutes = max(0, int(await get_config("browse_minutes", "5") or 0))
+    except (TypeError, ValueError):
+        minutes = 5
+    if minutes == 0 or ((await get_config("browse_admin_exempt", "1")) == "1" and is_admin(user_id)):
+        return False
+    session = await create_browse_session(user_id, fid)
+    if not session or not session[1]:
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT CASE WHEN datetime('now') >= ? THEN 1 ELSE 0 END",
+            (session[1],),
+        ) as cur:
+            row = await cur.fetchone()
+    return bool(row and row[0])
+
+
+def browse_start_keyboard(fid: str):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="▶️ 开始浏览资源", callback_data=f"source_browse_start:{fid}")
+    ]])
+
+
+async def send_browse_page_summary(message: Message, fid: str, rows, offset: int, sent: int, skipped_video_batch: bool = False):
+    total = len(rows)
+    next_offset = min(offset + 10, total)
+    remaining = max(0, total - next_offset)
+    if skipped_video_batch:
+        note = "⏱️ 浏览时限已结束，本批包含视频，已跳过该批。其他不含视频的批次仍可继续。"
+    else:
+        note = f"📦 本批已发送 {sent} 个资源。"
+    if remaining:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=f"📦 继续发送（剩余 {remaining} 个）",
+                callback_data=f"source_more:{fid}:{next_offset}",
+            )
+        ]])
+        await message.answer(f"{note}\n剩余 {remaining} 个，点击下方继续。", reply_markup=kb)
+    elif skipped_video_batch:
+        await message.answer(note + "\n本文件夹已没有其他批次。")
+    else:
+        await message.answer(f"✅ 该文件夹资源已发送完毕，本批发送 {sent} 个。")
+
+
 @dp.callback_query(F.data.startswith("source_unlock:"))
 async def source_folder_unlock(callback: CallbackQuery):
     user_id = callback.from_user.id
@@ -561,60 +641,90 @@ async def source_folder_unlock(callback: CallbackQuery):
             (user_id, fid),
         ) as cur:
             existing = await cur.fetchone()
-        if existing:
-            await db.rollback()
-            await callback.answer("你已解锁过这个文件夹，不会重复扣积分。", show_alert=True)
-            return
-        async with db.execute("SELECT points FROM users WHERE user_id=?", (user_id,)) as cur:
-            user_row = await cur.fetchone()
-        price_value = await get_config("source_folder_price", "10")
-        price = max(0, int(price_value if price_value is not None else 10))
-        if not user_row or int(user_row[0]) < price:
-            await db.rollback()
-            await callback.answer(f"积分不足，需要 {price} 积分。", show_alert=True)
-            return
+        if not existing:
+            async with db.execute("SELECT points FROM users WHERE user_id=?", (user_id,)) as cur:
+                user_row = await cur.fetchone()
+            price_value = await get_config("source_folder_price", "10")
+            price = max(0, int(price_value if price_value is not None else 10))
+            if not user_row or int(user_row[0]) < price:
+                await db.rollback()
+                await callback.answer(f"积分不足，需要 {price} 积分。", show_alert=True)
+                return
+            async with db.execute(
+                "SELECT 1 FROM source_resources WHERE folder_id=? LIMIT 1",
+                (fid,),
+            ) as cur:
+                has_resources = await cur.fetchone()
+            if not has_resources:
+                await db.rollback()
+                await callback.answer("没有找到该文件夹的资源消息", show_alert=True)
+                return
+            await db.execute(
+                "UPDATE users SET points=points-?, total_spent=total_spent+?, unlocked_count=unlocked_count+1 WHERE user_id=?",
+                (price, price, user_id),
+            )
+            await db.execute(
+                "INSERT INTO source_folder_unlocks (user_id, source_folder_id) VALUES (?, ?)",
+                (user_id, fid),
+            )
+        await db.commit()
+    await callback.answer("已解锁" if not existing else "你已解锁过，不会重复扣积分")
+    await callback.message.edit_text(
+        f"🔓 文件夹「{folder[0]}」已解锁。\n\n点击「开始浏览资源」后开始计时；时间到后，机器人将停止发送受限资源。已发送的内容无法撤回。",
+        reply_markup=browse_start_keyboard(fid),
+    )
+
+
+@dp.callback_query(F.data.startswith("source_browse_start:"))
+async def source_browse_start(callback: CallbackQuery):
+    try:
+        fid = str(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.answer("文件夹参数无效", show_alert=True)
+        return
+    user_id = callback.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT chat_id, message_id FROM source_resources WHERE folder_id=? ORDER BY message_id",
+            "SELECT 1 FROM source_folder_unlocks WHERE user_id=? AND source_folder_id=?",
+            (user_id, fid),
+        ) as cur:
+            unlocked = await cur.fetchone()
+        async with db.execute(
+            "SELECT chat_id, message_id, file_type FROM source_resources WHERE folder_id=? ORDER BY message_id",
             (fid,),
         ) as cur:
             rows = await cur.fetchall()
-        if not rows:
-            await db.rollback()
-            await callback.answer("没有找到该文件夹的资源消息", show_alert=True)
-            return
-        await db.execute(
-            "UPDATE users SET points=points-?, total_spent=total_spent+?, unlocked_count=unlocked_count+1 WHERE user_id=?",
-            (price, price, user_id),
-        )
-        await db.execute(
-            "INSERT INTO source_folder_unlocks (user_id, source_folder_id) VALUES (?, ?)",
-            (user_id, fid),
-        )
-        await db.commit()
-    await callback.answer("解锁成功")
+    if not unlocked:
+        await callback.answer("请先解锁这个文件夹。", show_alert=True)
+        return
+    if not rows:
+        await callback.answer("该文件夹没有可发送的资源。", show_alert=True)
+        return
+    session = await create_browse_session(user_id, fid)
+    if await browse_session_expired(user_id, fid):
+        await callback.answer("该文件夹的浏览时限已结束，不能重新开始计时。", show_alert=True)
+        return
     try:
-        await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-    await callback.message.answer(f"🎉 已解锁「{folder[0]}」。本次先发送 10 个文件，剩余资源可点击按钮继续获取。")
-    first_page = rows[:10]
-    sent = await send_source_messages(callback.message.chat.id, first_page)
-    next_offset = len(first_page)
-    if next_offset < len(rows):
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text=f"📦 继续发送（剩余 {len(rows) - next_offset} 个）",
-                callback_data=f"source_more:{fid}:{next_offset}",
-            )
-        ]])
-        await callback.message.answer(
-            f"📦 本次已发送 {sent} 个，剩余 {len(rows) - next_offset} 个。\n需要的话点击下方继续，每次最多发送 10 个。",
-            reply_markup=kb,
-        )
+        minutes = max(0, int(await get_config("browse_minutes", "5") or 0))
+    except (TypeError, ValueError):
+        minutes = 5
+    admin_exempt = (await get_config("browse_admin_exempt", "1")) == "1" and is_admin(user_id)
+    if minutes == 0:
+        time_text = "本文件夹未设置浏览时限。"
+    elif admin_exempt:
+        time_text = "管理员账号不受浏览时限限制。"
+    elif session and session[1]:
+        time_text = f"本次浏览时限：{minutes} 分钟，从点击开始时计算。"
     else:
-        await callback.message.answer(f"📦 发送完成，本文件夹共发送 {sent} 个资源。")
-
-
+        time_text = "浏览计时已启动。"
+    await callback.answer("开始浏览")
+    try:
+        await callback.message.edit_text(f"▶️ 已开始浏览文件夹。\n{time_text}\n时间到后，已发送内容不会撤回。")
+    except Exception:
+        await callback.message.answer(f"▶️ 已开始浏览文件夹。\n{time_text}")
+    first_page = rows[:10]
+    sent = await send_source_messages(callback.message.chat.id, [(r[0], r[1]) for r in first_page])
+    await send_browse_page_summary(callback.message, fid, rows, 0, sent)
 
 
 @dp.callback_query(F.data.startswith("source_more:"))
@@ -633,36 +743,31 @@ async def source_folder_more(callback: CallbackQuery):
             (user_id, fid),
         ) as cur:
             unlocked = await cur.fetchone()
-        if not unlocked:
-            await callback.answer("请先解锁这个文件夹。", show_alert=True)
-            return
         async with db.execute(
-            "SELECT chat_id, message_id FROM source_resources WHERE folder_id=? ORDER BY message_id",
+            "SELECT chat_id, message_id, file_type FROM source_resources WHERE folder_id=? ORDER BY message_id",
             (fid,),
         ) as cur:
             rows = await cur.fetchall()
-
+    if not unlocked:
+        await callback.answer("请先解锁这个文件夹。", show_alert=True)
+        return
     if offset >= len(rows):
         await callback.answer("这个文件夹的资源已经发送完了。", show_alert=True)
         return
 
-    await callback.answer("正在发送下一批")
+    expired = await browse_session_expired(user_id, fid)
+    scope = await get_config("browse_scope", "all")
     page = rows[offset:offset + 10]
-    sent = await send_source_messages(callback.message.chat.id, page)
-    next_offset = offset + len(page)
-    if next_offset < len(rows):
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text=f"📦 继续发送（剩余 {len(rows) - next_offset} 个）",
-                callback_data=f"source_more:{fid}:{next_offset}",
-            )
-        ]])
-        await callback.message.answer(
-            f"📦 本次已发送 {sent} 个，剩余 {len(rows) - next_offset} 个。每次最多发送 10 个。",
-            reply_markup=kb,
-        )
-    else:
-        await callback.message.answer(f"✅ 该文件夹资源已发送完毕，本批发送 {sent} 个。")
+    has_video = any(any(kind in str(row[2] or "").lower() for kind in ("video", "animation")) for row in page)
+    if expired and scope != "videos":
+        await callback.answer("浏览时限已结束，无法继续发送该文件夹资源。", show_alert=True)
+        return
+    await callback.answer("正在发送下一批")
+    if expired and scope == "videos" and has_video:
+        await send_browse_page_summary(callback.message, fid, rows, offset, 0, skipped_video_batch=True)
+        return
+    sent = await send_source_messages(callback.message.chat.id, [(r[0], r[1]) for r in page])
+    await send_browse_page_summary(callback.message, fid, rows, offset, sent)
 
 
 async def get_or_create_user(user_id: int, username: str):
