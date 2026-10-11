@@ -1,6 +1,7 @@
 import asyncio
 import os
 import random
+import json
 from datetime import date
 
 import aiosqlite
@@ -13,11 +14,13 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     CallbackQuery,
+    FSInputFile,
 )
 from dotenv import load_dotenv
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 if not BOT_TOKEN:
     raise ValueError("请在 .env 文件中设置 BOT_TOKEN")
@@ -47,9 +50,15 @@ async def init_db():
                 image_count INTEGER DEFAULT 0,
                 video_count INTEGER DEFAULT 0,
                 file_count INTEGER DEFAULT 0,
-                price INTEGER DEFAULT 1
+                price INTEGER DEFAULT 1,
+                file_ids TEXT DEFAULT '[]'
             )
         """)
+        # 兼容旧表，如果没有 file_ids 列则添加
+        try:
+            await db.execute("ALTER TABLE resources ADD COLUMN file_ids TEXT DEFAULT '[]'")
+        except:
+            pass
         await db.execute("""
             CREATE TABLE IF NOT EXISTS unlocks (
                 user_id INTEGER,
@@ -64,14 +73,6 @@ async def init_db():
                 checkin_date TEXT,
                 PRIMARY KEY (user_id, checkin_date)
             )
-        """)
-        # 示例资源（可自行替换为合规内容）
-        await db.execute("""
-            INSERT OR IGNORE INTO resources (id, title, description, image_count, video_count, file_count, price)
-            VALUES 
-            (1, '示例资源1', '这是一个合规示例资源', 2, 1, 3, 1),
-            (2, '示例资源2', '另一个合规示例', 1, 0, 2, 2),
-            (3, '示例资源3', '第三个合规示例', 0, 2, 1, 3)
         """)
         await db.commit()
 
@@ -93,6 +94,10 @@ async def get_or_create_user(user_id: int, username: str):
         return row
 
 
+def is_admin(user_id: int) -> bool:
+    return ADMIN_ID and user_id == ADMIN_ID
+
+
 def main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[
@@ -111,6 +116,92 @@ async def cmd_start(message: Message):
         "欢迎使用悦己分享机器人\n请选择下方按钮操作。",
         reply_markup=main_keyboard(),
     )
+
+
+@dp.message(Command("add"))
+async def cmd_add(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("无权限")
+        return
+    await message.answer(
+        "管理员上传资源说明：\n"
+        "1. 先发文字：标题|描述|积分价格\n"
+        "   例如：示例资源|这是合规资源描述|2\n"
+        "2. 然后连续发送图片/视频/文件（可多个）\n"
+        "3. 发送完成后回复「完成」结束上传\n"
+        "现在请先发送文字信息。"
+    )
+
+
+# 临时存储上传状态
+upload_state = {}
+
+
+@dp.message(F.text.contains("|") & F.from_user.id == ADMIN_ID)
+async def start_upload(message: Message):
+    parts = message.text.split("|")
+    if len(parts) < 3:
+        await message.answer("格式错误，请用：标题|描述|价格")
+        return
+    title, desc, price_str = parts[0].strip(), parts[1].strip(), parts[2].strip()
+    try:
+        price = int(price_str)
+    except:
+        await message.answer("价格必须是数字")
+        return
+    upload_state[message.from_user.id] = {
+        "title": title,
+        "description": desc,
+        "price": price,
+        "files": [],
+    }
+    await message.answer("已记录信息，请连续发送文件（图片/视频/文档），发完回复「完成」")
+
+
+@dp.message(F.photo | F.video | F.document)
+async def collect_files(message: Message):
+    if message.from_user.id not in upload_state:
+        return
+    state = upload_state[message.from_user.id]
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        state["files"].append({"type": "photo", "file_id": file_id})
+    elif message.video:
+        file_id = message.video.file_id
+        state["files"].append({"type": "video", "file_id": file_id})
+    elif message.document:
+        file_id = message.document.file_id
+        state["files"].append({"type": "document", "file_id": file_id})
+    await message.answer(f"已收到文件，当前共 {len(state['files'])} 个")
+
+
+@dp.message(F.text == "完成")
+async def finish_upload(message: Message):
+    if message.from_user.id not in upload_state:
+        return
+    state = upload_state.pop(message.from_user.id)
+    files = state["files"]
+    img_count = sum(1 for f in files if f["type"] == "photo")
+    vid_count = sum(1 for f in files if f["type"] == "video")
+    file_count = sum(1 for f in files if f["type"] == "document")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO resources (title, description, image_count, video_count, file_count, price, file_ids)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                state["title"],
+                state["description"],
+                img_count,
+                vid_count,
+                file_count,
+                state["price"],
+                json.dumps(files),
+            ),
+        )
+        await db.commit()
+    await message.answer(f"资源「{state['title']}」上传成功，共 {len(files)} 个文件。")
 
 
 @dp.message(F.text == "我的信息")
@@ -180,7 +271,7 @@ async def help_cmd(message: Message):
         "• 新用户注册赠送 10 积分\n"
         "• 每日签到可获得 1-3 积分\n"
         "• 点击「随机资源」可预览并解锁\n"
-        "• 解锁后可随时查看已解锁内容\n"
+        "• 解锁后会直接发送文件，也可在「我的信息」中重新查看\n"
         "• 购买积分请点击对应按钮"
     )
     await message.answer(text)
@@ -215,19 +306,35 @@ async def random_resource(message: Message):
         await message.answer(text, reply_markup=kb)
 
 
+async def send_resource_files(chat_id: int, file_ids_json: str):
+    try:
+        files = json.loads(file_ids_json or "[]")
+    except:
+        files = []
+    for f in files:
+        fid = f.get("file_id")
+        ftype = f.get("type")
+        if ftype == "photo":
+            await bot.send_photo(chat_id, fid)
+        elif ftype == "video":
+            await bot.send_video(chat_id, fid)
+        elif ftype == "document":
+            await bot.send_document(chat_id, fid)
+
+
 @dp.callback_query(F.data.startswith("unlock_"))
 async def unlock_callback(callback: CallbackQuery):
     rid = int(callback.data.split("_")[1])
     user_id = callback.from_user.id
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT price FROM resources WHERE id = ?", (rid,)
+            "SELECT price, file_ids FROM resources WHERE id = ?", (rid,)
         ) as cursor:
             row = await cursor.fetchone()
         if not row:
             await callback.answer("资源不存在")
             return
-        price = row[0]
+        price, file_ids = row
         async with db.execute(
             "SELECT points FROM users WHERE user_id = ?", (user_id,)
         ) as cursor:
@@ -246,7 +353,8 @@ async def unlock_callback(callback: CallbackQuery):
         await db.commit()
     await callback.answer("解锁成功")
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer("已解锁，可在「我的信息」中查看已解锁资源。")
+    await callback.message.answer("解锁成功，正在发送文件...")
+    await send_resource_files(callback.message.chat.id, file_ids)
 
 
 @dp.callback_query(F.data == "view_unlocked")
@@ -255,7 +363,7 @@ async def view_unlocked(callback: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             """
-            SELECT r.title FROM unlocks u
+            SELECT r.id, r.title, r.file_ids FROM unlocks u
             JOIN resources r ON u.resource_id = r.id
             WHERE u.user_id = ?
             """,
@@ -265,14 +373,14 @@ async def view_unlocked(callback: CallbackQuery):
     if not rows:
         await callback.message.answer("暂无已解锁资源。")
     else:
-        text = "已解锁资源：\n" + "\n".join(f"• {r[0]}" for r in rows)
-        await callback.message.answer(text)
+        for rid, title, file_ids in rows:
+            await callback.message.answer(f"【{title}】")
+            await send_resource_files(callback.message.chat.id, file_ids)
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def buy_callback(callback: CallbackQuery):
-    # 这里可以接 Telegram Stars 或其他支付，目前仅示例
     await callback.answer("支付功能待接入", show_alert=True)
 
 
