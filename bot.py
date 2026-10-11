@@ -397,7 +397,7 @@ async def send_source_folder_card(message: Message, folder):
     # photo/video previews into one album. Keep the descriptive text and buttons below it.
     if not already_unlocked and len(preview_rows) >= 2:
         album = []
-        for chat_id, mid, file_type, raw in candidates[:3]:
+        for index, (chat_id, mid, file_type, raw) in enumerate(candidates[:3]):
             kind = str(file_type or "").lower()
             try:
                 payload = json.loads(raw or "{}")
@@ -407,10 +407,13 @@ async def send_source_folder_card(message: Message, folder):
             if not file_id:
                 album = []
                 break
+            # Telegram album captions are attached to one media item; put the full
+            # folder description on the first item so the text is part of the album.
+            caption = text if index == 0 else None
             if "photo" in kind or "image" in kind or "picture" in kind:
-                album.append(InputMediaPhoto(media=file_id))
+                album.append(InputMediaPhoto(media=file_id, caption=caption))
             elif "video" in kind:
-                album.append(InputMediaVideo(media=file_id))
+                album.append(InputMediaVideo(media=file_id, caption=caption))
             else:
                 # Telegram media albums do not support animations/documents as album items.
                 album = []
@@ -422,7 +425,9 @@ async def send_source_folder_card(message: Message, folder):
                     media=album,
                     protect_content=True,
                 )
-                await message.answer(text, reply_markup=kb)
+                # Telegram Bot API does not support inline buttons on sendMediaGroup.
+                # Keep the album caption attached to the first item and put actions below it.
+                await message.answer("👇 选择操作：", reply_markup=kb)
                 return
             except Exception as exc:
                 print("Source preview album error:", str(exc)[:300])
