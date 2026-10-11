@@ -402,48 +402,69 @@ async def send_source_folder_card(message: Message, folder):
         await message.answer(text, reply_markup=kb)
         return True
 
-    # Do not copy each source message to the admin chat to probe its media:
-    # Bot API copy_message returns MessageId, not a Message with photo/video fields.
-    # Probing this way caused every candidate to be copied repeatedly. Only use
-    # file IDs already stored in the source DB, and skip this folder if none work.
+    # Forward each candidate temporarily to the admin chat. Unlike copy_message,
+    # forward_message returns the full Message object, including this bot's usable
+    # photo/video file_id. Keep the staging operation bounded and always clean up.
+    staging_chat_id = ADMIN_ID
+    staged_ids = []
     album = []
-    for _, _, file_type, stored_file_id, raw in candidates:
+    seen = set()
+    for source_chat_id, message_id, file_type, stored_file_id, raw in candidates:
         kind = str(file_type or "").lower()
-        try:
-            payload = json.loads(raw or "{}")
-        except (TypeError, json.JSONDecodeError):
-            payload = {}
-        file_id = str(stored_file_id or payload.get("fileId") or payload.get("file_id") or "").strip()
-        if not file_id:
+        if not any(k in kind for k in ("photo", "image", "picture", "video")):
             continue
-        if "photo" in kind or "image" in kind or "picture" in kind:
-            album.append(("photo", file_id))
-        elif "video" in kind:
-            album.append(("video", file_id))
+        if not source_chat_id or not message_id or (str(source_chat_id), int(message_id)) in seen:
+            continue
+        seen.add((str(source_chat_id), int(message_id)))
+        try:
+            forwarded = await bot.forward_message(
+                chat_id=staging_chat_id,
+                from_chat_id=source_chat_id,
+                message_id=int(message_id),
+            )
+        except Exception as exc:
+            print("Source preview staging forward error:", str(exc)[:240])
+            continue
+        staged_ids.append(forwarded.message_id)
+        media_kind = None
+        media_file_id = None
+        if getattr(forwarded, "photo", None):
+            media_kind = "photo"
+            media_file_id = forwarded.photo[-1].file_id
+        elif getattr(forwarded, "video", None):
+            media_kind = "video"
+            media_file_id = forwarded.video.file_id
+        if media_kind and media_file_id:
+            album.append((media_kind, media_file_id))
         if len(album) >= 3:
             break
 
-    if len(album) < 2:
-        return False
-
-    media = []
-    for index, (kind, file_id) in enumerate(album[:3]):
-        caption = text if index == 0 else None
-        if kind == "photo":
-            media.append(InputMediaPhoto(media=file_id, caption=caption))
-        else:
-            media.append(InputMediaVideo(media=file_id, caption=caption))
     try:
-        await bot.send_media_group(
-            chat_id=message.chat.id,
-            media=media,
-            protect_content=True,
-        )
-        await message.answer("👇 选择操作：", reply_markup=kb)
-        return True
+        if len(album) >= 2:
+            media = []
+            for index, (kind, file_id) in enumerate(album[:3]):
+                caption = text if index == 0 else None
+                if kind == "photo":
+                    media.append(InputMediaPhoto(media=file_id, caption=caption))
+                else:
+                    media.append(InputMediaVideo(media=file_id, caption=caption))
+            await bot.send_media_group(
+                chat_id=message.chat.id,
+                media=media,
+                protect_content=True,
+            )
+            await message.answer("👇 选择操作：", reply_markup=kb)
+            return True
+        return False
     except Exception as exc:
         print("Source preview album error:", str(exc)[:300])
         return False
+    finally:
+        if staged_ids:
+            try:
+                await bot.delete_messages(chat_id=staging_chat_id, message_ids=staged_ids)
+            except Exception as exc:
+                print("Source preview staging cleanup error:", str(exc)[:200])
 
 
 async def choose_random_source_folder(message: Message):
