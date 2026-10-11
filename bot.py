@@ -1,6 +1,7 @@
 import asyncio
 import os
 import random
+import secrets
 import json
 from datetime import date
 
@@ -36,7 +37,7 @@ DEFAULT_CONFIG = {
     "buy_options": "10,30,50,100",
     "random_count": "3",
     "welcome_text": "🌷 欢迎来到「悦己」\n━━━━━━━━━━━━━━\n✨ 发现喜欢的内容，解锁专属资源\n🎁 每日签到领取积分\n🎲 随机探索精选资源\n👤 随时查看个人积分与解锁记录\n\n👇 请使用下方菜单开始体验",
-    "help_text": "💡 悦己使用指南\n━━━━━━━━━━━━━━\n👤 我的信息：查看积分与解锁记录\n🎁 每日签到：每天领取随机积分奖励\n🎲 随机资源：浏览资源并使用积分解锁\n🛍️ 购买积分：选择对应积分档位\n\n🔐 解锁成功后，机器人会发送对应资源。\n如有疑问，请联系管理员。",
+    "help_text": "💡 悦己使用指南\n━━━━━━━━━━━━━━\n👤 我的信息：查看积分与解锁记录\n🎁 每日签到：每天领取随机积分奖励\n🎲 随机资源：浏览资源并使用积分解锁\n🛍️ 购买积分：查看积分档位并获取兑换码\n🎟️ 积分兑换：在购买积分页面输入兑换码\n\n🔐 解锁成功后，机器人会发送对应资源。\n如有疑问，请联系管理员。",
     "welcome_image_file_id": "",
 }
 
@@ -85,6 +86,16 @@ async def init_db():
                 value TEXT
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS redemption_codes (
+                code TEXT PRIMARY KEY,
+                points INTEGER NOT NULL,
+                created_by INTEGER NOT NULL,
+                created_at TEXT DEFAULT (datetime('now')),
+                used_by INTEGER,
+                used_at TEXT
+            )
+        """)
         for k, v in DEFAULT_CONFIG.items():
             await db.execute(
                 "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)", (k, v)
@@ -131,9 +142,8 @@ def is_admin(user_id: int) -> bool:
 
 def main_keyboard(user_id: int = 0):
     rows = [
-        [KeyboardButton(text="👤 我的信息"), KeyboardButton(text="🎁 每日签到")],
-        [KeyboardButton(text="🛍️ 购买积分"), KeyboardButton(text="💡 帮助")],
-        [KeyboardButton(text="🎲 随机资源")],
+        [KeyboardButton(text="👤 我的信息"), KeyboardButton(text="🎁 每日签到"), KeyboardButton(text="🎲 随机资源")],
+        [KeyboardButton(text="🛍️ 购买积分"), KeyboardButton(text="💡 用户帮助")],
     ]
     if is_admin(user_id):
         rows.append([KeyboardButton(text="⚙️ 设置中心")])
@@ -198,6 +208,7 @@ async def settings_center(message: Message):
         [InlineKeyboardButton(text="🎲 随机资源数量", callback_data="settings_random_count")],
         [InlineKeyboardButton(text="✏️ 修改欢迎文案", callback_data="settings_text:welcome_text"), InlineKeyboardButton(text="💡 修改帮助文案", callback_data="settings_text:help_text")],
         [InlineKeyboardButton(text="🖼️ 设置欢迎图片", callback_data="settings_welcome_image")],
+        [InlineKeyboardButton(text="🎟️ 兑换码管理", callback_data="codes_manage")],
         [InlineKeyboardButton(text="📋 查看当前设置", callback_data="settings_show")],
     ])
     await message.answer("⚙️ 悦己设置中心\n━━━━━━━━━━━━━━\n请选择要调整的项目。大部分设置可直接点击完成。", reply_markup=kb)
@@ -215,10 +226,83 @@ async def settings_home_callback(callback: CallbackQuery):
         [InlineKeyboardButton(text="🎲 随机资源数量", callback_data="settings_random_count")],
         [InlineKeyboardButton(text="✏️ 修改欢迎文案", callback_data="settings_text:welcome_text"), InlineKeyboardButton(text="💡 修改帮助文案", callback_data="settings_text:help_text")],
         [InlineKeyboardButton(text="🖼️ 设置欢迎图片", callback_data="settings_welcome_image")],
+        [InlineKeyboardButton(text="🎟️ 兑换码管理", callback_data="codes_manage")],
         [InlineKeyboardButton(text="📋 查看当前设置", callback_data="settings_show")],
     ])
     await callback.message.edit_text("⚙️ 悦己设置中心\n━━━━━━━━━━━━━━\n请选择要调整的项目。", reply_markup=kb)
     await callback.answer()
+
+
+@dp.callback_query(F.data == "codes_manage")
+async def codes_manage(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="生成 10 积分码", callback_data="codes_points:10"),
+         InlineKeyboardButton(text="生成 30 积分码", callback_data="codes_points:30")],
+        [InlineKeyboardButton(text="生成 50 积分码", callback_data="codes_points:50"),
+         InlineKeyboardButton(text="生成 100 积分码", callback_data="codes_points:100")],
+        [InlineKeyboardButton(text="↩️ 返回设置", callback_data="settings_home")],
+    ])
+    await callback.message.edit_text(
+        "🎟️ 兑换码管理\\n━━━━━━━━━━━━━━\\n先选择每个兑换码对应的积分，再选择生成数量。\\n每个兑换码只能成功兑换一次。",
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("codes_points:"))
+async def codes_choose_quantity(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    points = callback.data.split(":", 1)[1]
+    if not points.isdigit() or int(points) not in (10, 30, 50, 100):
+        await callback.answer("积分档位无效", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="生成 1 个", callback_data=f"codes_generate:{points}:1"),
+         InlineKeyboardButton(text="生成 5 个", callback_data=f"codes_generate:{points}:5")],
+        [InlineKeyboardButton(text="生成 10 个", callback_data=f"codes_generate:{points}:10"),
+         InlineKeyboardButton(text="生成 20 个", callback_data=f"codes_generate:{points}:20")],
+        [InlineKeyboardButton(text="↩️ 返回兑换码管理", callback_data="codes_manage")],
+    ])
+    await callback.message.edit_text(f"🎟️ 每个兑换码价值 {points} 积分。\\n请选择本次生成数量：", reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("codes_generate:"))
+async def codes_generate(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    try:
+        _, points_s, quantity_s = callback.data.split(":")
+        points, quantity = int(points_s), int(quantity_s)
+    except (ValueError, TypeError):
+        await callback.answer("参数无效", show_alert=True)
+        return
+    if points not in (10, 30, 50, 100) or quantity not in (1, 5, 10, 20):
+        await callback.answer("生成参数无效", show_alert=True)
+        return
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    generated = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        for _ in range(quantity):
+            code = "YJ-" + "".join(secrets.choice(alphabet) for _ in range(10))
+            await db.execute(
+                "INSERT INTO redemption_codes (code, points, created_by) VALUES (?, ?, ?)",
+                (code, points, callback.from_user.id),
+            )
+            generated.append(code)
+        await db.commit()
+    body = "\\n".join(generated)
+    await callback.message.answer(
+        f"✅ 已生成 {quantity} 个兑换码\\n每个兑换码：{points} 积分\\n\\n{body}\\n\\n请妥善保管并只发给已完成付款的用户。兑换码可使用一次。"
+    )
+    await callback.answer("生成成功")
+    await callback.message.edit_reply_markup(reply_markup=None)
 
 
 @dp.callback_query(F.data == "settings_start_points")
@@ -504,12 +588,14 @@ async def buy_points(message: Message):
         opt = opt.strip()
         if opt.isdigit():
             buttons.append([InlineKeyboardButton(text=f"{opt} 积分", callback_data=f"buy_{opt}")])
-    buttons.append([InlineKeyboardButton(text="自定义", callback_data="buy_custom")])
+    buttons.append([InlineKeyboardButton(text="🎟️ 输入积分兑换码", callback_data="redeem_start")])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     points, _, _ = await get_or_create_user(message.from_user.id, message.from_user.username or "")
-    await message.answer(f"🛍️ 积分中心\n━━━━━━━━━━━━━━\n💎 当前积分：{points}\n👇 请选择一个积分档位：\n\n⚠️ 在线支付功能尚未接入。", reply_markup=kb)
+    await message.answer(f"🛍️ 积分中心\n━━━━━━━━━━━━━━\n💎 当前积分：{points}\n👇 购买后获取兑换码，再点击下方按钮兑换积分。\n\nℹ️ 积分档位仅作参考，购买渠道请以管理员提供的信息为准。", reply_markup=kb)
 
 
+@dp.message(F.text == "💡 用户帮助")
+@dp.message(F.text == "用户帮助")
 @dp.message(F.text == "💡 帮助")
 @dp.message(F.text == "帮助")
 async def help_cmd(message: Message):
@@ -625,9 +711,19 @@ async def view_unlocked(callback: CallbackQuery):
     await callback.answer()
 
 
+redeem_state = set()
+
+
+@dp.callback_query(F.data == "redeem_start")
+async def redeem_start(callback: CallbackQuery):
+    redeem_state.add(callback.from_user.id)
+    await callback.message.answer("🎟️ 请发送你的积分兑换码。\\n发送「取消兑换」可退出。")
+    await callback.answer()
+
+
 @dp.callback_query(F.data.startswith("buy_"))
 async def buy_callback(callback: CallbackQuery):
-    await callback.answer("积分支付功能尚未接入，请联系管理员。", show_alert=True)
+    await callback.answer("请按管理员提供的购买渠道获取兑换码，再点击「输入积分兑换码」。", show_alert=True)
 
 
 @dp.message(F.from_user.id == ADMIN_ID)
@@ -648,6 +744,51 @@ async def handle_pending_admin_text(message: Message):
     await set_config(key, message.text)
     pending_config.pop(user_id, None)
     await message.answer("✅ 文案已保存！\n下次用户打开对应页面时就会使用新文案。")
+
+
+@dp.message(F.text)
+async def redeem_code_message(message: Message):
+    user_id = message.from_user.id
+    if message.text == "取消兑换" and user_id in redeem_state:
+        redeem_state.discard(user_id)
+        await message.answer("已取消兑换。")
+        return
+    if user_id not in redeem_state:
+        return
+    code = (message.text or "").strip().upper().replace(" ", "")
+    if not code or len(code) > 40:
+        await message.answer("兑换码格式不正确，请重新发送，或发送「取消兑换」。")
+        return
+    await get_or_create_user(user_id, message.from_user.username or "")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute(
+            "SELECT points FROM redemption_codes WHERE code = ? AND used_by IS NULL",
+            (code,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if not row:
+            await db.rollback()
+            redeem_state.discard(user_id)
+            await message.answer("❌ 兑换码无效或已被使用，请检查后重新获取新的兑换码。")
+            return
+        points = int(row[0])
+        cursor = await db.execute(
+            "UPDATE redemption_codes SET used_by = ?, used_at = datetime('now') WHERE code = ? AND used_by IS NULL",
+            (user_id, code),
+        )
+        if cursor.rowcount != 1:
+            await db.rollback()
+            redeem_state.discard(user_id)
+            await message.answer("❌ 该兑换码刚刚已被兑换，请获取新的兑换码。")
+            return
+        await db.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (points, user_id))
+        await db.commit()
+    redeem_state.discard(user_id)
+    new_points, _, _ = await get_or_create_user(user_id, message.from_user.username or "")
+    await message.answer(
+        f"🎉 兑换成功！\\n━━━━━━━━━━━━━━\\n🎟️ 兑换积分：+{points}\\n💎 当前余额：{new_points} 积分"
+    )
 
 
 async def main():
