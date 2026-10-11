@@ -507,25 +507,73 @@ async def send_source_folder_card(message: Message, folder):
             (message.from_user.id, str(fid)),
         ) as cur:
             already_unlocked = await cur.fetchone()
+
     text = (
         f"📁 {name}\n━━━━━━━━━━━━━━\n"
         f"🎬 视频/动画：{videos}\n🖼️ 图片：{images}\n📄 其他文件：{files}\n"
         f"📦 资源记录：{total}\n"
         f"🔓 整个文件夹解锁：{price} 积分\n💎 你的余额：{points} 积分\n\n"
-        "先为你展示最多 3 条预览，解锁后可获取该文件夹的全部资源。"
+        "预览仅供参考，解锁后可获取该文件夹的全部资源。"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🔓 解锁整个文件夹（{price} 积分）", callback_data=f"source_unlock:{fid}")],
         [InlineKeyboardButton(text="🎲 再随机一个文件夹", callback_data="source_random_again")],
     ])
 
+    # 单条、非相册媒体优先直接发送：说明和解锁按钮附着在同一条媒体消息上。
+    # 只使用同步数据库中的真实 file_id；没有可用 file_id 或属于相册时，
+    # 回退到 copy_messages，保持原频道媒体组/相册结构，不拆散相册。
+    def contains_media_group(value, depth=0):
+        if depth > 6:
+            return False
+        if isinstance(value, dict):
+            if value.get("media_group_id") or value.get("mediaGroupId"):
+                return True
+            return any(contains_media_group(v, depth + 1) for v in value.values())
+        if isinstance(value, list):
+            return any(contains_media_group(v, depth + 1) for v in value)
+        return False
+
+    for source_chat_id, message_id, file_type, stored_file_id, raw in candidates:
+        kind = str(file_type or "").lower()
+        file_id = str(stored_file_id or "").strip()
+        if not file_id or not source_chat_id or not message_id:
+            continue
+        if not any(token in kind for token in ("photo", "image", "picture", "video", "animation", "document", "file")):
+            continue
+        try:
+            data = json.loads(raw or "{}")
+        except (TypeError, ValueError):
+            data = {}
+        if contains_media_group(data):
+            continue
+
+        try:
+            send_kwargs = {
+                "chat_id": message.chat.id,
+                "caption": text,
+                "reply_markup": kb,
+                "protect_content": True,
+            }
+            if any(token in kind for token in ("photo", "image", "picture")):
+                await bot.send_photo(photo=file_id, **send_kwargs)
+            elif "animation" in kind:
+                await bot.send_animation(animation=file_id, **send_kwargs)
+            elif "video" in kind:
+                await bot.send_video(video=file_id, **send_kwargs)
+            else:
+                await bot.send_document(document=file_id, **send_kwargs)
+            return True
+        except Exception as exc:
+            # 例如 file_id 不属于当前机器人时，继续尝试其他单条媒体；
+            # 最后仍会回退到按源消息 ID 复制，避免随机功能整体失效。
+            print("Random folder single-media preview failed:", str(exc)[:220])
+
+    # 回退路径：没有可直接发送的单条媒体时，保留原有说明卡片和源消息复制方式。
     if already_unlocked:
         await message.answer(text, reply_markup=kb)
         return True
 
-    # Keep the preview's original Telegram message structure. In particular,
-    # copy_messages preserves a source album as an album instead of rebuilding
-    # unrelated items into a synthetic media group.
     preview_rows = []
     seen = set()
     for source_chat_id, message_id, file_type, stored_file_id, raw in candidates:
@@ -540,8 +588,6 @@ async def send_source_folder_card(message: Message, folder):
         if len(preview_rows) >= 3:
             break
 
-    # Keep the folder description and buttons separate from media captions;
-    # this avoids making an album look like a single video/message.
     await message.answer(text, reply_markup=kb)
     if preview_rows:
         try:
@@ -730,10 +776,21 @@ async def source_folder_unlock(callback: CallbackQuery):
             )
         await db.commit()
     await callback.answer("已解锁" if not existing else "你已解锁过，不会重复扣积分")
-    await callback.message.edit_text(
-        f"🔓 文件夹「{folder[0]}」已解锁。\n\n点击「开始浏览资源」后开始计时；时间到后，机器人将停止发送受限资源。已发送的内容无法撤回。",
-        reply_markup=browse_start_keyboard(fid),
+    unlocked_text = (
+        f"🔓 文件夹「{folder[0]}」已解锁。\n\n"
+        "点击「开始浏览资源」后开始计时；时间到后，机器人将停止发送受限资源。已发送的内容无法撤回。"
     )
+    keyboard = browse_start_keyboard(fid)
+    try:
+        # 普通说明卡片用 edit_text；媒体预览卡片必须用 edit_caption，
+        # 否则积分扣除成功后 Telegram 会因“消息没有文本”而报错。
+        if callback.message.caption is not None:
+            await callback.message.edit_caption(caption=unlocked_text, reply_markup=keyboard)
+        else:
+            await callback.message.edit_text(unlocked_text, reply_markup=keyboard)
+    except Exception as exc:
+        print("Source unlock confirmation edit failed:", str(exc)[:220])
+        await callback.message.answer(unlocked_text, reply_markup=keyboard)
 
 
 @dp.callback_query(F.data.startswith("source_browse_start:"))
