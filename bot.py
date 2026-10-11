@@ -126,9 +126,14 @@ async def init_db():
                 message_id INTEGER NOT NULL,
                 title TEXT,
                 file_type TEXT,
+                file_id TEXT,
                 data TEXT
             )
         """)
+        async with db.execute("PRAGMA table_info(source_resources)") as cur:
+            existing_columns = {row[1] for row in await cur.fetchall()}
+        if "file_id" not in existing_columns:
+            await db.execute("ALTER TABLE source_resources ADD COLUMN file_id TEXT")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_source_resources_folder ON source_resources(folder_id)")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS source_folder_unlocks (
@@ -282,7 +287,7 @@ async def sync_source_repository():
             await cur.execute("SELECT id, name, data FROM folders WHERE status <> 'deleted' ORDER BY sort_order, name")
             folder_rows = await cur.fetchall()
             await cur.execute(
-                "SELECT resource_key, folder_id, chat_id, message_id, title, file_type, data FROM resources WHERE status <> 'deleted' AND chat_id=%s ORDER BY message_id",
+                "SELECT resource_key, folder_id, chat_id, message_id, title, file_type, file_id, data FROM resources WHERE status <> 'deleted' AND chat_id=%s ORDER BY message_id",
                 (repo_id,),
             )
             resource_rows = await cur.fetchall()
@@ -314,10 +319,10 @@ async def sync_source_repository():
                 (fid, str(name or "未命名文件夹"), st["all"], st["image"], st["video"], st["file"]),
             )
             folder_map[fid] = True
-        for key, folder_id, chat_id, message_id, title, file_type, raw in resource_rows:
+        for key, folder_id, chat_id, message_id, title, file_type, file_id, raw in resource_rows:
             await db.execute(
-                "INSERT OR REPLACE INTO source_resources (resource_key, folder_id, chat_id, message_id, title, file_type, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (str(key), str(folder_id or ""), str(chat_id), int(message_id or 0), str(title or ""), str(file_type or ""), str(raw or "{}")),
+                "INSERT OR REPLACE INTO source_resources (resource_key, folder_id, chat_id, message_id, title, file_type, file_id, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(key), str(folder_id or ""), str(chat_id), int(message_id or 0), str(title or ""), str(file_type or ""), str(file_id or ""), str(raw or "{}")),
             )
         await db.commit()
     await set_config("source_repo_id", repo_id)
@@ -372,7 +377,7 @@ async def send_source_folder_card(message: Message, folder):
     price = int(await get_config("source_folder_price", "10") or 10)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT chat_id, message_id, file_type, data FROM source_resources WHERE folder_id=? ORDER BY message_id LIMIT 20",
+            "SELECT chat_id, message_id, file_type, file_id, data FROM source_resources WHERE folder_id=? ORDER BY message_id LIMIT 20",
             (str(fid),),
         ) as cur:
             candidates = await cur.fetchall()
@@ -392,18 +397,18 @@ async def send_source_folder_card(message: Message, folder):
         [InlineKeyboardButton(text=f"🔓 解锁整个文件夹（{price} 积分）", callback_data=f"source_unlock:{fid}")],
         [InlineKeyboardButton(text="🎲 再随机一个文件夹", callback_data="source_random_again")],
     ])
-    preview_rows = [(chat_id, mid) for chat_id, mid, _, _ in candidates[:3]]
+    preview_rows = [(chat_id, mid) for chat_id, mid, _, _, _ in candidates[:3]]
     # If the source records contain reusable Telegram file IDs, combine up to three
     # photo/video previews into one album. Keep the descriptive text and buttons below it.
     if not already_unlocked and len(preview_rows) >= 2:
         album = []
-        for index, (chat_id, mid, file_type, raw) in enumerate(candidates[:3]):
+        for index, (chat_id, mid, file_type, stored_file_id, raw) in enumerate(candidates[:3]):
             kind = str(file_type or "").lower()
             try:
                 payload = json.loads(raw or "{}")
             except (TypeError, json.JSONDecodeError):
                 payload = {}
-            file_id = str(payload.get("fileId") or payload.get("file_id") or "").strip()
+            file_id = str(stored_file_id or payload.get("fileId") or payload.get("file_id") or "").strip()
             if not file_id:
                 album = []
                 break
@@ -431,22 +436,14 @@ async def send_source_folder_card(message: Message, folder):
                 return
             except Exception as exc:
                 print("Source preview album error:", str(exc)[:300])
-                # Different bots may not be able to reuse the source bot's file_id.
-                # Fall back to copying the original messages rather than losing the preview.
+                await message.answer("⚠️ 这组预览暂时无法合并成相册，未拆开发送。请管理员检查资源文件类型和文件 ID。")
+                return
 
-    # Fallback: copy the original messages. This preserves an album only if the source
-    # messages were already grouped together in Telegram.
-    await message.answer(text, reply_markup=kb)
-    if preview_rows and not already_unlocked:
-        try:
-            await send_source_messages(message.chat.id, preview_rows, preview=True)
-        except Exception as exc:
-            try:
-                await message.edit_reply_markup(reply_markup=None)
-            except Exception:
-                pass
-            await message.answer("⚠️ 预览发送失败，暂时无法解锁这个文件夹。请管理员检查悦己机器人是否已加入原仓库并有读取权限。")
-            print("Source preview error:", str(exc)[:300])
+    # Do not send the description separately: the user's requirement is that it
+    # must be the caption of the same album. If album creation is impossible,
+    # report failure rather than sending separate text and files.
+    if not already_unlocked and preview_rows:
+        await message.answer("⚠️ 当前这组资源无法组成相册（需要 2–3 个可用的图片/视频文件 ID）。为避免文字与相册分开，本次没有拆开发送。")
 
 async def choose_random_source_folder(message: Message):
     async with aiosqlite.connect(DB_PATH) as db:
