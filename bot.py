@@ -525,24 +525,35 @@ async def random_resource(message: Message):
     count = int(await get_config("random_count", "3"))
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            f"SELECT id, title, description, image_count, video_count, file_count, price FROM resources ORDER BY RANDOM() LIMIT {count}"
+            f"SELECT id, title, description, image_count, video_count, file_count, price, file_ids FROM resources ORDER BY RANDOM() LIMIT {count}"
         ) as cursor:
             rows = await cursor.fetchall()
     if not rows:
         await message.answer("📭 暂时还没有可展示的资源。\n请稍后再来探索，感谢你的耐心。")
         return
     for row in rows:
-        rid, title, desc, img, vid, files, price = row
+        rid, title, desc, img, vid, files, price, file_ids_json = row
         text = (
-            f"🌷 {title}\n━━━━━━━━━━━━━━\n"
-            f"📝 {desc or '暂无简介'}\n\n"
-            f"🖼️ 图片：{img}  |  🎬 视频：{vid}  |  📄 文件：{files}\n"
-            f"🔓 解锁价格：{price} 积分\n💎 你的余额：{points} 积分\n\n"
+            f"🌷 {title}\\n━━━━━━━━━━━━━━\\n"
+            f"📝 {desc or '暂无简介'}\\n\\n"
+            f"🖼️ 图片：{img}  |  🎬 视频：{vid}  |  📄 文件：{files}\\n"
+            f"🔓 解锁价格：{price} 积分\\n💎 你的余额：{points} 积分\\n\\n"
             "👇 点击下方按钮解锁资源"
         )
         kb = InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text=f"🔓 解锁（{price} 积分）", callback_data=f"unlock_{rid}")]]
         )
+        try:
+            resource_files = json.loads(file_ids_json or "[]")
+        except Exception:
+            resource_files = []
+        preview = next((item.get("file_id") for item in resource_files if item.get("type") == "photo" and item.get("file_id")), None)
+        if preview and len(text) <= 1024:
+            try:
+                await message.answer_photo(preview, caption=text, reply_markup=kb)
+                continue
+            except Exception:
+                pass
         await message.answer(text, reply_markup=kb)
 
 
