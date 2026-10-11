@@ -700,6 +700,18 @@ async def source_browse_start(callback: CallbackQuery):
     if not rows:
         await callback.answer("该文件夹没有可发送的资源。", show_alert=True)
         return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM source_browse_sessions WHERE user_id=? AND source_folder_id=?",
+            (user_id, fid),
+        ) as cur:
+            existing_session = await cur.fetchone()
+    if existing_session:
+        if await browse_session_expired(user_id, fid):
+            await callback.answer("该文件夹的浏览时限已结束，不能重新开始计时。", show_alert=True)
+        else:
+            await callback.answer("浏览计时已经开始，请使用原有的「继续发送」按钮，避免重复发送。", show_alert=True)
+        return
     session = await create_browse_session(user_id, fid)
     if await browse_session_expired(user_id, fid):
         await callback.answer("该文件夹的浏览时限已结束，不能重新开始计时。", show_alert=True)
@@ -1221,10 +1233,12 @@ async def admin_users(callback: CallbackQuery, answer_callback: bool = True):
         buttons.append([InlineKeyboardButton(text="📋 返回最近用户", callback_data="admin_users_clear_search")])
     buttons.append([InlineKeyboardButton(text="🔄 刷新", callback_data="admin_users")])
     buttons.append([InlineKeyboardButton(text="↩️ 返回设置中心", callback_data="settings_home")])
-    await callback.message.edit_text(
-        "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-    )
+    text = "\n".join(lines)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    try:
+        await callback.message.edit_text(text, reply_markup=keyboard)
+    except Exception:
+        await callback.message.answer(text, reply_markup=keyboard)
     if answer_callback:
         await callback.answer()
 
