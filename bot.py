@@ -341,7 +341,7 @@ async def source_repository_keyboard():
 
 
 async def send_source_messages(chat_id: int, rows, preview: bool = False):
-    # Copy messages from the original repository rather than reusing bot-specific file_id values.
+    # Copy only the requested page. A normal unlock sends at most 10 source messages.
     # Telegram copyMessages preserves media-group/album structure when the source messages are grouped.
     grouped = {}
     for source_chat_id, message_id in rows:
@@ -353,8 +353,8 @@ async def send_source_messages(chat_id: int, rows, preview: bool = False):
         message_ids = sorted(set(message_ids))
         if preview:
             message_ids = message_ids[:3]
-        for start in range(0, len(message_ids), 100):
-            batch = message_ids[start:start + 100]
+        for start in range(0, len(message_ids), 10 if not preview else 3):
+            batch = message_ids[start:start + (10 if not preview else 3)]
             try:
                 await bot.copy_messages(
                     chat_id=chat_id,
@@ -366,7 +366,7 @@ async def send_source_messages(chat_id: int, rows, preview: bool = False):
             except Exception as exc:
                 if preview:
                     raise RuntimeError("预览文件发送失败，请确认悦己机器人已加入原仓库且有读取权限：" + str(exc)[:250])
-                # Continue later batches so one inaccessible/deleted message does not stop all others.
+                print("Source resource batch copy error:", str(exc)[:200])
                 continue
     return sent
 
@@ -549,11 +549,73 @@ async def source_folder_unlock(callback: CallbackQuery):
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-    await callback.message.answer(f"🎉 已解锁「{folder[0]}」，正在发送文件夹资源，请稍候。")
-    sent = await send_source_messages(callback.message.chat.id, rows)
-    await callback.message.answer(f"📦 发送任务完成，已提交 {sent} 条消息。\n如有少量资源未能发送，可能是原消息已删除或悦己机器人没有读取权限。")
+    await callback.message.answer(f"🎉 已解锁「{folder[0]}」。本次先发送 10 个文件，剩余资源可点击按钮继续获取。")
+    first_page = rows[:10]
+    sent = await send_source_messages(callback.message.chat.id, first_page)
+    next_offset = len(first_page)
+    if next_offset < len(rows):
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=f"📦 继续发送（剩余 {len(rows) - next_offset} 个）",
+                callback_data=f"source_more:{fid}:{next_offset}",
+            )
+        ]])
+        await callback.message.answer(
+            f"📦 本次已发送 {sent} 个，剩余 {len(rows) - next_offset} 个。\n需要的话点击下方继续，每次最多发送 10 个。",
+            reply_markup=kb,
+        )
+    else:
+        await callback.message.answer(f"📦 发送完成，本文件夹共发送 {sent} 个资源。")
 
 
+
+
+@dp.callback_query(F.data.startswith("source_more:"))
+async def source_folder_more(callback: CallbackQuery):
+    try:
+        _, fid, offset_text = callback.data.split(":", 2)
+        offset = max(0, int(offset_text))
+    except (ValueError, TypeError):
+        await callback.answer("分页参数无效，请重新进入文件夹。", show_alert=True)
+        return
+
+    user_id = callback.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM source_folder_unlocks WHERE user_id=? AND source_folder_id=?",
+            (user_id, fid),
+        ) as cur:
+            unlocked = await cur.fetchone()
+        if not unlocked:
+            await callback.answer("请先解锁这个文件夹。", show_alert=True)
+            return
+        async with db.execute(
+            "SELECT chat_id, message_id FROM source_resources WHERE folder_id=? ORDER BY message_id",
+            (fid,),
+        ) as cur:
+            rows = await cur.fetchall()
+
+    if offset >= len(rows):
+        await callback.answer("这个文件夹的资源已经发送完了。", show_alert=True)
+        return
+
+    await callback.answer("正在发送下一批")
+    page = rows[offset:offset + 10]
+    sent = await send_source_messages(callback.message.chat.id, page)
+    next_offset = offset + len(page)
+    if next_offset < len(rows):
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text=f"📦 继续发送（剩余 {len(rows) - next_offset} 个）",
+                callback_data=f"source_more:{fid}:{next_offset}",
+            )
+        ]])
+        await callback.message.answer(
+            f"📦 本次已发送 {sent} 个，剩余 {len(rows) - next_offset} 个。每次最多发送 10 个。",
+            reply_markup=kb,
+        )
+    else:
+        await callback.message.answer(f"✅ 该文件夹资源已发送完毕，本批发送 {sent} 个。")
 
 
 async def get_or_create_user(user_id: int, username: str):
