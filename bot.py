@@ -1223,55 +1223,28 @@ async def help_cmd(message: Message):
 @dp.message(F.text == "🎲 随机资源")
 @dp.message(F.text == "随机资源")
 async def random_resource(message: Message):
-    if await choose_random_source_folder(message):
-        return
-    # If synced source folders exist, do not misleadingly fall back to the
-    # unrelated local resources table and claim the whole library is empty.
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT COUNT(*) FROM source_folders WHERE item_count > 0") as cur:
-            source_count_row = await cur.fetchone()
-    if source_count_row and int(source_count_row[0] or 0) > 0:
-        await message.answer(
-            "⚠️ 已同步到资源文件夹，但这次没能读取到至少两个可组成相册的图片/视频。"
-            "请确认悦己机器人仍在原仓库频道内且有查看权限；如果频道开启了内容保护，机器人可能无法转发预览。"
-            "本次没有发送重复文件，请稍后重试或联系管理员检查。"
-        )
-        return
-    user_id = message.from_user.id
-    points, _, _ = await get_or_create_user(user_id, message.from_user.username or "")
-    count = int(await get_config("random_count", "3"))
+    # Random browsing must use the synced folder library only. Never fall back
+    # to the unrelated legacy resources table, which can send stray videos/cards.
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            f"SELECT id, title, description, image_count, video_count, file_count, price, file_ids FROM resources ORDER BY RANDOM() LIMIT {count}"
-        ) as cursor:
-            rows = await cursor.fetchall()
-    if not rows:
-        await message.answer("📭 暂时还没有可展示的资源。\n请稍后再来探索，感谢你的耐心。")
+            "SELECT COUNT(*) FROM source_folders WHERE item_count > 0"
+        ) as cur:
+            row = await cur.fetchone()
+    folder_count = int(row[0] or 0) if row else 0
+
+    if folder_count <= 0:
+        await message.answer(
+            "📭 暂时没有可随机展示的已同步资源文件夹。\n"
+            "请稍后重试，或联系管理员在「资源仓库管理」中同步文件夹与文件。"
+        )
         return
-    for row in rows:
-        rid, title, desc, img, vid, files, price, file_ids_json = row
-        text = (
-            f"🌷 {title}\n━━━━━━━━━━━━━━\n"
-            f"📝 {desc or '暂无简介'}\n\n"
-            f"🖼️ 图片：{img}  |  🎬 视频：{vid}  |  📄 文件：{files}\n"
-            f"🔓 解锁价格：{price} 积分\n💎 你的余额：{points} 积分\n\n"
-            "👇 点击下方按钮解锁资源"
+
+    if not await choose_random_source_folder(message):
+        await message.answer(
+            "⚠️ 已找到资源文件夹，但暂时无法生成预览相册。\n"
+            "本次不会发送其他资源或随机视频。请确认悦己机器人仍在原仓库频道内且有查看权限，"
+            "并检查频道是否开启了内容保护；之后请管理员检查同步记录。"
         )
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text=f"🔓 解锁（{price} 积分）", callback_data=f"unlock_{rid}")]]
-        )
-        try:
-            resource_files = json.loads(file_ids_json or "[]")
-        except Exception:
-            resource_files = []
-        preview = next((item.get("file_id") for item in resource_files if item.get("type") == "photo" and item.get("file_id")), None)
-        if preview and len(text) <= 1024:
-            try:
-                await message.answer_photo(preview, caption=text, reply_markup=kb)
-                continue
-            except Exception:
-                pass
-        await message.answer(text, reply_markup=kb)
 
 
 async def send_resource_files(chat_id: int, file_ids_json: str):
