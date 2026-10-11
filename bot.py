@@ -50,6 +50,19 @@ DEFAULT_CONFIG = {
     "browse_minutes": "5",
     "browse_scope": "all",
     "browse_admin_exempt": "1",
+    "daily_unlock_limit": "0",
+    "menu_my_info_text": "👤 我的信息",
+    "menu_checkin_text": "🎁 每日签到",
+    "menu_random_text": "🎲 随机资源",
+    "menu_buy_text": "🛍️ 购买积分",
+    "menu_help_text": "💡 用户帮助",
+    "menu_show_my_info": "1",
+    "menu_show_checkin": "1",
+    "menu_show_random": "1",
+    "menu_show_buy": "1",
+    "menu_show_help": "1",
+    "announcement_text": "",
+    "support_url": "",
 }
 
 
@@ -186,6 +199,7 @@ async def validate_config_value(key: str, value: str):
         "source_folder_price": (0, 1000000),
         "random_count": (1, 10),
         "browse_minutes": (0, 1440),
+        "daily_unlock_limit": (0, 1000),
         "checkin_min": (0, 100000),
         "checkin_max": (0, 100000),
     }
@@ -212,6 +226,29 @@ async def validate_config_value(key: str, value: str):
             if number < low_value:
                 return None, "签到最高奖励不能低于当前最低奖励。"
         return str(number), None
+    menu_label_keys = {
+        "menu_my_info_text", "menu_checkin_text", "menu_random_text",
+        "menu_buy_text", "menu_help_text",
+    }
+    if key in menu_label_keys:
+        if not value or len(value) > 32 or "\n" in value:
+            return None, "菜单名称不能为空，最多 32 个字符且不能换行。"
+        for other_key in menu_label_keys:
+            if other_key != key and value == await get_config(other_key, DEFAULT_CONFIG[other_key]):
+                return None, "菜单名称不能与其他菜单重复。"
+        return value, None
+    if key in ("menu_show_my_info", "menu_show_checkin", "menu_show_random", "menu_show_buy", "menu_show_help"):
+        if value not in ("0", "1"):
+            return None, "菜单显示状态无效。"
+        return value, None
+    if key == "announcement_text":
+        if len(value) > 1000:
+            return None, "公告最多 1000 个字符。"
+        return value, None
+    if key == "support_url":
+        if value and (not value.startswith(("https://", "http://")) or not urlparse(value).netloc):
+            return None, "客服链接请填写完整的 http:// 或 https:// URL。"
+        return value, None
     if key == "browse_scope":
         if value not in ("all", "videos"):
             return None, "浏览范围只能设置为全部资源或视频。"
@@ -642,6 +679,21 @@ async def source_folder_unlock(callback: CallbackQuery):
         ) as cur:
             existing = await cur.fetchone()
         if not existing:
+            try:
+                daily_limit = max(0, int(await get_config("daily_unlock_limit", "0") or 0))
+            except (TypeError, ValueError):
+                daily_limit = 0
+            if daily_limit and not is_admin(user_id):
+                async with db.execute(
+                    "SELECT COUNT(*) FROM source_folder_unlocks WHERE user_id=? AND date(unlocked_at)=date('now')",
+                    (user_id,),
+                ) as cur:
+                    daily_row = await cur.fetchone()
+                used_today = int(daily_row[0] or 0) if daily_row else 0
+                if used_today >= daily_limit:
+                    await db.rollback()
+                    await callback.answer(f"今天已达到文件夹解锁上限（{daily_limit} 个），请明天再来。", show_alert=True)
+                    return
             async with db.execute("SELECT points FROM users WHERE user_id=?", (user_id,)) as cur:
                 user_row = await cur.fetchone()
             price_value = await get_config("source_folder_price", "10")
@@ -825,11 +877,23 @@ dp.message.outer_middleware(UserAccessMiddleware())
 dp.callback_query.outer_middleware(UserAccessMiddleware())
 
 
-def main_keyboard(user_id: int = 0):
-    rows = [
-        [KeyboardButton(text="👤 我的信息"), KeyboardButton(text="🎁 每日签到"), KeyboardButton(text="🎲 随机资源")],
-        [KeyboardButton(text="🛍️ 购买积分"), KeyboardButton(text="💡 用户帮助")],
+async def main_keyboard(user_id: int = 0):
+    menu_items = [
+        ("menu_show_my_info", "menu_my_info_text"),
+        ("menu_show_checkin", "menu_checkin_text"),
+        ("menu_show_random", "menu_random_text"),
+        ("menu_show_buy", "menu_buy_text"),
+        ("menu_show_help", "menu_help_text"),
     ]
+    visible = []
+    for show_key, text_key in menu_items:
+        if await get_config(show_key, "1") == "1":
+            visible.append(KeyboardButton(text=await get_config(text_key, DEFAULT_CONFIG[text_key])))
+    rows = []
+    if visible:
+        rows.append(visible[:3])
+    if len(visible) > 3:
+        rows.append(visible[3:])
     if is_admin(user_id):
         rows.append([KeyboardButton(text="⚙️ 设置中心")])
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
@@ -840,7 +904,13 @@ async def cmd_start(message: Message):
     await get_or_create_user(message.from_user.id, message.from_user.username or "")
     welcome = await get_config("welcome_text") or DEFAULT_CONFIG["welcome_text"]
     image_id = await get_config("welcome_image_file_id", "")
-    keyboard = main_keyboard(message.from_user.id)
+    announcement = await get_config("announcement_text", "")
+    if announcement:
+        welcome += "\n\n📢 公告\n━━━━━━━━━━━━━━\n" + announcement
+    support_url = await get_config("support_url", "")
+    if support_url:
+        welcome += "\n\n🆘 客服：" + support_url
+    keyboard = await main_keyboard(message.from_user.id)
     if image_id:
         try:
             if len(welcome) <= 1024:
