@@ -370,10 +370,10 @@ async def send_source_folder_card(message: Message, folder):
     price = int(await get_config("source_folder_price", "10") or 10)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT chat_id, message_id FROM source_resources WHERE folder_id=? ORDER BY message_id LIMIT 3",
+            "SELECT chat_id, message_id, file_type FROM source_resources WHERE folder_id=? ORDER BY message_id LIMIT 20",
             (str(fid),),
         ) as cur:
-            preview_rows = await cur.fetchall()
+            candidates = await cur.fetchall()
         async with db.execute(
             "SELECT 1 FROM source_folder_unlocks WHERE user_id=? AND source_folder_id=?",
             (message.from_user.id, str(fid)),
@@ -390,6 +390,29 @@ async def send_source_folder_card(message: Message, folder):
         [InlineKeyboardButton(text=f"🔓 解锁整个文件夹（{price} 积分）", callback_data=f"source_unlock:{fid}")],
         [InlineKeyboardButton(text="🎲 再随机一个文件夹", callback_data="source_random_again")],
     ])
+    preview_rows = [(chat_id, mid) for chat_id, mid, _ in candidates[:3]]
+    image_row = next(
+        ((chat_id, mid) for chat_id, mid, file_type in candidates
+         if any(word in str(file_type or "").lower() for word in ("photo", "image", "picture"))),
+        None,
+    )
+    # Attach the folder description and buttons directly to a copied image.
+    if image_row and not already_unlocked:
+        try:
+            await bot.copy_message(
+                chat_id=message.chat.id,
+                from_chat_id=str(image_row[0]),
+                message_id=int(image_row[1]),
+                caption=text,
+                reply_markup=kb,
+                protect_content=True,
+            )
+            preview_rows = [row for row in preview_rows if row != image_row][:2]
+            if preview_rows:
+                await send_source_messages(message.chat.id, preview_rows, preview=True)
+            return
+        except Exception as exc:
+            print("Source image caption preview error:", str(exc)[:300])
     await message.answer(text, reply_markup=kb)
     if preview_rows and not already_unlocked:
         try:
