@@ -402,69 +402,32 @@ async def send_source_folder_card(message: Message, folder):
         await message.answer(text, reply_markup=kb)
         return True
 
-    # Forward each candidate temporarily to the admin chat. Unlike copy_message,
-    # forward_message returns the full Message object, including this bot's usable
-    # photo/video file_id. Keep the staging operation bounded and always clean up.
-    staging_chat_id = ADMIN_ID
-    staged_ids = []
-    album = []
+    # Keep the preview's original Telegram message structure. In particular,
+    # copy_messages preserves a source album as an album instead of rebuilding
+    # unrelated items into a synthetic media group.
+    preview_rows = []
     seen = set()
     for source_chat_id, message_id, file_type, stored_file_id, raw in candidates:
         kind = str(file_type or "").lower()
         if not any(k in kind for k in ("photo", "image", "picture", "video")):
             continue
-        if not source_chat_id or not message_id or (str(source_chat_id), int(message_id)) in seen:
+        key = (str(source_chat_id), int(message_id or 0))
+        if not source_chat_id or not message_id or key in seen:
             continue
-        seen.add((str(source_chat_id), int(message_id)))
-        try:
-            forwarded = await bot.forward_message(
-                chat_id=staging_chat_id,
-                from_chat_id=source_chat_id,
-                message_id=int(message_id),
-            )
-        except Exception as exc:
-            print("Source preview staging forward error:", str(exc)[:240])
-            continue
-        staged_ids.append(forwarded.message_id)
-        media_kind = None
-        media_file_id = None
-        if getattr(forwarded, "photo", None):
-            media_kind = "photo"
-            media_file_id = forwarded.photo[-1].file_id
-        elif getattr(forwarded, "video", None):
-            media_kind = "video"
-            media_file_id = forwarded.video.file_id
-        if media_kind and media_file_id:
-            album.append((media_kind, media_file_id))
-        if len(album) >= 3:
+        seen.add(key)
+        preview_rows.append((source_chat_id, int(message_id)))
+        if len(preview_rows) >= 3:
             break
 
-    try:
-        if len(album) >= 2:
-            media = []
-            for index, (kind, file_id) in enumerate(album[:3]):
-                caption = text if index == 0 else None
-                if kind == "photo":
-                    media.append(InputMediaPhoto(media=file_id, caption=caption))
-                else:
-                    media.append(InputMediaVideo(media=file_id, caption=caption))
-            await bot.send_media_group(
-                chat_id=message.chat.id,
-                media=media,
-                protect_content=True,
-            )
-            await message.answer("👇 选择操作：", reply_markup=kb)
-            return True
-        return False
-    except Exception as exc:
-        print("Source preview album error:", str(exc)[:300])
-        return False
-    finally:
-        if staged_ids:
-            try:
-                await bot.delete_messages(chat_id=staging_chat_id, message_ids=staged_ids)
-            except Exception as exc:
-                print("Source preview staging cleanup error:", str(exc)[:200])
+    # Keep the folder description and buttons separate from media captions;
+    # this avoids making an album look like a single video/message.
+    await message.answer(text, reply_markup=kb)
+    if preview_rows:
+        try:
+            await send_source_messages(message.chat.id, preview_rows, preview=True)
+        except Exception as exc:
+            print("Source preview copy error:", str(exc)[:300])
+    return True
 
 
 async def choose_random_source_folder(message: Message):
