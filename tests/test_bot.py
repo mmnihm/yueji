@@ -23,6 +23,9 @@ class YuejiBotSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await app.get_config("browse_scope"), "all")
         self.assertEqual(await app.get_config("browse_admin_exempt"), "1")
         self.assertEqual(await app.get_config("random_count"), "3")
+        self.assertEqual(await app.get_config("daily_unlock_limit"), "0")
+        self.assertEqual(await app.get_config("menu_show_random"), "1")
+        self.assertEqual(await app.get_config("announcement_text"), "")
 
     async def test_config_validation_limits(self):
         value, error = await app.validate_config_value("browse_minutes", "10")
@@ -40,6 +43,18 @@ class YuejiBotSmokeTests(unittest.IsolatedAsyncioTestCase):
         value, error = await app.validate_config_value("browse_scope", "videos")
         self.assertEqual(value, "videos")
         self.assertIsNone(error)
+
+        value, error = await app.validate_config_value("daily_unlock_limit", "3")
+        self.assertEqual(value, "3")
+        self.assertIsNone(error)
+
+        value, error = await app.validate_config_value("daily_unlock_limit", "1001")
+        self.assertIsNone(value)
+        self.assertIsNotNone(error)
+
+        value, error = await app.validate_config_value("menu_my_info_text", "🎁 每日签到")
+        self.assertIsNone(value)
+        self.assertIsNotNone(error)
 
     async def test_browse_session_starts_with_expiry_for_regular_user(self):
         session = await app.create_browse_session(987654, "folder-a")
