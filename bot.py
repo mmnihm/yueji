@@ -43,6 +43,7 @@ DEFAULT_CONFIG = {
     "help_text": "💡 悦己使用指南\n━━━━━━━━━━━━━━\n👤 我的信息：查看积分与解锁记录\n🎁 每日签到：每天领取随机积分奖励\n🎲 随机资源：浏览资源并使用积分解锁\n🛍️ 购买积分：查看积分档位并获取兑换码\n🎟️ 积分兑换：在购买积分页面输入兑换码\n\n🔐 解锁成功后，机器人会发送对应资源。\n如有疑问，请联系管理员。",
     "welcome_image_file_id": "",
     "source_repo_id": "",
+    "source_folder_price": "10",
 }
 
 
@@ -127,6 +128,14 @@ async def init_db():
             )
         """)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_source_resources_folder ON source_resources(folder_id)")
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS source_folder_unlocks (
+                user_id INTEGER NOT NULL,
+                source_folder_id TEXT NOT NULL,
+                unlocked_at TEXT DEFAULT (datetime('now')),
+                PRIMARY KEY (user_id, source_folder_id)
+            )
+        """)
         await db.commit()
 
 
@@ -324,6 +333,157 @@ async def source_repository_keyboard():
     ])
 
 
+async def send_source_messages(chat_id: int, rows, preview: bool = False):
+    # Copy messages from the original repository rather than reusing bot-specific file_id values.
+    # Telegram copyMessages preserves media-group/album structure when the source messages are grouped.
+    grouped = {}
+    for source_chat_id, message_id in rows:
+        if not source_chat_id or not message_id:
+            continue
+        grouped.setdefault(str(source_chat_id), []).append(int(message_id))
+    sent = 0
+    for source_chat_id, message_ids in grouped.items():
+        message_ids = sorted(set(message_ids))
+        if preview:
+            message_ids = message_ids[:3]
+        for start in range(0, len(message_ids), 100):
+            batch = message_ids[start:start + 100]
+            try:
+                await bot.copy_messages(
+                    chat_id=chat_id,
+                    from_chat_id=source_chat_id,
+                    message_ids=batch,
+                    protect_content=True,
+                )
+                sent += len(batch)
+            except Exception as exc:
+                if preview:
+                    raise RuntimeError("预览文件发送失败，请确认悦己机器人已加入原仓库且有读取权限：" + str(exc)[:250])
+                # Continue later batches so one inaccessible/deleted message does not stop all others.
+                continue
+    return sent
+
+
+async def send_source_folder_card(message: Message, folder):
+    fid, name, total, images, videos, files = folder
+    points, _, _ = await get_or_create_user(message.from_user.id, message.from_user.username or "")
+    price = int(await get_config("source_folder_price", "10") or 10)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT chat_id, message_id FROM source_resources WHERE folder_id=? ORDER BY message_id LIMIT 3",
+            (str(fid),),
+        ) as cur:
+            preview_rows = await cur.fetchall()
+        async with db.execute(
+            "SELECT 1 FROM source_folder_unlocks WHERE user_id=? AND source_folder_id=?",
+            (message.from_user.id, str(fid)),
+        ) as cur:
+            already_unlocked = await cur.fetchone()
+    text = (
+        f"📁 {name}\n━━━━━━━━━━━━━━\n"
+        f"🎬 视频/动画：{videos}\n🖼️ 图片：{images}\n📄 其他文件：{files}\n"
+        f"📦 资源记录：{total}\n"
+        f"🔓 整个文件夹解锁：{price} 积分\n💎 你的余额：{points} 积分\n\n"
+        "先为你展示最多 3 条预览，解锁后可获取该文件夹的全部资源。"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🔓 解锁整个文件夹（{price} 积分）", callback_data=f"source_unlock:{fid}")],
+        [InlineKeyboardButton(text="🎲 再随机一个文件夹", callback_data="source_random_again")],
+    ])
+    await message.answer(text, reply_markup=kb)
+    if preview_rows and not already_unlocked:
+        try:
+            await send_source_messages(message.chat.id, preview_rows, preview=True)
+        except Exception as exc:
+            await message.answer("⚠️ 预览发送失败。请管理员检查悦己机器人是否已加入原仓库并有读取权限。")
+            print("Source preview error:", str(exc)[:300])
+
+
+async def choose_random_source_folder(message: Message):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT source_folder_id, name, item_count, image_count, video_count, file_count FROM source_folders WHERE item_count > 0 ORDER BY RANDOM() LIMIT 1"
+        ) as cur:
+            folder = await cur.fetchone()
+    if not folder:
+        return False
+    await send_source_folder_card(message, folder)
+    return True
+
+
+@dp.callback_query(F.data == "source_random_again")
+async def source_random_again(callback: CallbackQuery):
+    await callback.answer()
+    if not await choose_random_source_folder(callback.message):
+        await callback.message.answer("📭 暂时没有已同步的资源文件夹，请稍后再试。")
+
+
+@dp.callback_query(F.data.startswith("source_unlock:"))
+async def source_folder_unlock(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    try:
+        fid = str(callback.data.split(":", 1)[1])
+    except Exception:
+        await callback.answer("文件夹参数无效", show_alert=True)
+        return
+    await get_or_create_user(user_id, callback.from_user.username or "")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute(
+            "SELECT name, item_count FROM source_folders WHERE source_folder_id=?",
+            (fid,),
+        ) as cur:
+            folder = await cur.fetchone()
+        if not folder or int(folder[1] or 0) <= 0:
+            await db.rollback()
+            await callback.answer("这个文件夹没有可用资源", show_alert=True)
+            return
+        async with db.execute(
+            "SELECT 1 FROM source_folder_unlocks WHERE user_id=? AND source_folder_id=?",
+            (user_id, fid),
+        ) as cur:
+            existing = await cur.fetchone()
+        if existing:
+            await db.rollback()
+            await callback.answer("你已解锁过这个文件夹，不会重复扣积分。", show_alert=True)
+            return
+        async with db.execute("SELECT points FROM users WHERE user_id=?", (user_id,)) as cur:
+            user_row = await cur.fetchone()
+        price = max(0, int(await get_config("source_folder_price", "10") or 10))
+        if not user_row or int(user_row[0]) < price:
+            await db.rollback()
+            await callback.answer(f"积分不足，需要 {price} 积分。", show_alert=True)
+            return
+        async with db.execute(
+            "SELECT chat_id, message_id FROM source_resources WHERE folder_id=? ORDER BY message_id",
+            (fid,),
+        ) as cur:
+            rows = await cur.fetchall()
+        if not rows:
+            await db.rollback()
+            await callback.answer("没有找到该文件夹的资源消息", show_alert=True)
+            return
+        await db.execute(
+            "UPDATE users SET points=points-?, total_spent=total_spent+?, unlocked_count=unlocked_count+1 WHERE user_id=?",
+            (price, price, user_id),
+        )
+        await db.execute(
+            "INSERT INTO source_folder_unlocks (user_id, source_folder_id) VALUES (?, ?)",
+            (user_id, fid),
+        )
+        await db.commit()
+    await callback.answer("解锁成功")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer(f"🎉 已解锁「{folder[0]}」，正在发送文件夹资源，请稍候。")
+    sent = await send_source_messages(callback.message.chat.id, rows)
+    await callback.message.answer(f"📦 发送任务完成，已提交 {sent} 条消息。\n如有少量资源未能发送，可能是原消息已删除或悦己机器人没有读取权限。")
+
+
+
+
 async def get_or_create_user(user_id: int, username: str):
     start_points = int(await get_config("start_points", "10"))
     async with aiosqlite.connect(DB_PATH) as db:
@@ -412,6 +572,8 @@ async def settings_center(message: Message):
         [InlineKeyboardButton(text="📅 每日签到奖励", callback_data="settings_checkin")],
         [InlineKeyboardButton(text="🛍️ 积分购买档位", callback_data="settings_buy_options")],
         [InlineKeyboardButton(text="🎲 随机资源数量", callback_data="settings_random_count")],
+        [InlineKeyboardButton(text="📦 文件夹解锁价格", callback_data="settings_source_price")],
+        [InlineKeyboardButton(text="📦 文件夹解锁价格", callback_data="settings_source_price")],
         [InlineKeyboardButton(text="✏️ 修改欢迎文案", callback_data="settings_text:welcome_text"), InlineKeyboardButton(text="💡 修改帮助文案", callback_data="settings_text:help_text")],
         [InlineKeyboardButton(text="🖼️ 设置欢迎图片", callback_data="settings_welcome_image")],
         [InlineKeyboardButton(text="🎟️ 兑换码管理", callback_data="codes_manage")],
@@ -712,6 +874,21 @@ async def settings_buy_options(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data == "settings_source_price")
+async def settings_source_price(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{n} 积分", callback_data=f"cfgset:source_folder_price:{n}") for n in (1, 5, 10)],
+        [InlineKeyboardButton(text=f"{n} 积分", callback_data=f"cfgset:source_folder_price:{n}") for n in (20, 50, 100)],
+        [InlineKeyboardButton(text="↩️ 返回设置", callback_data="settings_home")],
+    ])
+    current = await get_config("source_folder_price", "10")
+    await callback.message.edit_text(f"📦 当前每个资源文件夹解锁价格：{current} 积分\n请选择新价格：", reply_markup=kb)
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "settings_random_count")
 async def settings_random_count(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -728,7 +905,7 @@ async def settings_set_value(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("无权限", show_alert=True); return
     _, key, value = callback.data.split(":", 2)
-    if key not in ("start_points", "buy_options", "random_count"):
+    if key not in ("start_points", "buy_options", "random_count", "source_folder_price"):
         await callback.answer("不支持的设置项", show_alert=True); return
     if key == "buy_options" and not all(x.strip().isdigit() for x in value.split(",")):
         await callback.answer("档位格式不正确", show_alert=True); return
@@ -975,6 +1152,8 @@ async def help_cmd(message: Message):
 @dp.message(F.text == "🎲 随机资源")
 @dp.message(F.text == "随机资源")
 async def random_resource(message: Message):
+    if await choose_random_source_folder(message):
+        return
     user_id = message.from_user.id
     points, _, _ = await get_or_create_user(user_id, message.from_user.username or "")
     count = int(await get_config("random_count", "3"))
