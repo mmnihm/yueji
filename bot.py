@@ -534,10 +534,10 @@ async def random_resource(message: Message):
     for row in rows:
         rid, title, desc, img, vid, files, price, file_ids_json = row
         text = (
-            f"🌷 {title}\\n━━━━━━━━━━━━━━\\n"
-            f"📝 {desc or '暂无简介'}\\n\\n"
-            f"🖼️ 图片：{img}  |  🎬 视频：{vid}  |  📄 文件：{files}\\n"
-            f"🔓 解锁价格：{price} 积分\\n💎 你的余额：{points} 积分\\n\\n"
+            f"🌷 {title}\n━━━━━━━━━━━━━━\n"
+            f"📝 {desc or '暂无简介'}\n\n"
+            f"🖼️ 图片：{img}  |  🎬 视频：{vid}  |  📄 文件：{files}\n"
+            f"🔓 解锁价格：{price} 积分\n💎 你的余额：{points} 积分\n\n"
             "👇 点击下方按钮解锁资源"
         )
         kb = InlineKeyboardMarkup(
