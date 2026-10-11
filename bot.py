@@ -35,8 +35,9 @@ DEFAULT_CONFIG = {
     "checkin_max": "3",
     "buy_options": "10,30,50,100",
     "random_count": "3",
-    "welcome_text": "欢迎使用悦己分享机器人\n请选择下方按钮操作。",
-    "help_text": "使用帮助\n\n• 新用户注册赠送积分\n• 每日签到可获得积分\n• 点击「随机资源」可预览并解锁\n• 解锁后会直接发送文件\n• 购买积分请点击对应按钮",
+    "welcome_text": "🌷 欢迎来到「悦己」\n━━━━━━━━━━━━━━\n✨ 发现喜欢的内容，解锁专属资源\n🎁 每日签到领取积分\n🎲 随机探索精选资源\n👤 随时查看个人积分与解锁记录\n\n👇 请使用下方菜单开始体验",
+    "help_text": "💡 悦己使用指南\n━━━━━━━━━━━━━━\n👤 我的信息：查看积分与解锁记录\n🎁 每日签到：每天领取随机积分奖励\n🎲 随机资源：浏览资源并使用积分解锁\n🛍️ 购买积分：选择对应积分档位\n\n🔐 解锁成功后，机器人会发送对应资源。\n如有疑问，请联系管理员。",
+    "welcome_image_file_id": "",
 }
 
 
@@ -128,22 +129,34 @@ def is_admin(user_id: int) -> bool:
     return ADMIN_ID and user_id == ADMIN_ID
 
 
-def main_keyboard():
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="我的信息"), KeyboardButton(text="每日签到")],
-            [KeyboardButton(text="购买积分"), KeyboardButton(text="帮助")],
-            [KeyboardButton(text="随机资源")],
-        ],
-        resize_keyboard=True,
-    )
+def main_keyboard(user_id: int = 0):
+    rows = [
+        [KeyboardButton(text="👤 我的信息"), KeyboardButton(text="🎁 每日签到")],
+        [KeyboardButton(text="🛍️ 购买积分"), KeyboardButton(text="💡 帮助")],
+        [KeyboardButton(text="🎲 随机资源")],
+    ]
+    if is_admin(user_id):
+        rows.append([KeyboardButton(text="⚙️ 设置中心")])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     await get_or_create_user(message.from_user.id, message.from_user.username or "")
-    welcome = await get_config("welcome_text")
-    await message.answer(welcome, reply_markup=main_keyboard())
+    welcome = await get_config("welcome_text") or DEFAULT_CONFIG["welcome_text"]
+    image_id = await get_config("welcome_image_file_id", "")
+    keyboard = main_keyboard(message.from_user.id)
+    if image_id:
+        try:
+            if len(welcome) <= 1024:
+                await message.answer_photo(image_id, caption=welcome, reply_markup=keyboard)
+            else:
+                await message.answer_photo(image_id, caption="🌷 欢迎来到「悦己」", reply_markup=keyboard)
+                await message.answer(welcome)
+        except Exception:
+            await message.answer(welcome, reply_markup=keyboard)
+    else:
+        await message.answer(welcome, reply_markup=keyboard)
 
 
 @dp.message(Command("config"))
@@ -172,6 +185,152 @@ async def cmd_set(message: Message):
         return
     await set_config(key, value)
     await message.answer(f"已更新 {key} = {value}")
+
+
+@dp.message(F.text == "⚙️ 设置中心")
+async def settings_center(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎁 新用户赠送积分", callback_data="settings_start_points")],
+        [InlineKeyboardButton(text="📅 每日签到奖励", callback_data="settings_checkin")],
+        [InlineKeyboardButton(text="🛍️ 积分购买档位", callback_data="settings_buy_options")],
+        [InlineKeyboardButton(text="🎲 随机资源数量", callback_data="settings_random_count")],
+        [InlineKeyboardButton(text="✏️ 修改欢迎文案", callback_data="settings_text:welcome_text"), InlineKeyboardButton(text="💡 修改帮助文案", callback_data="settings_text:help_text")],
+        [InlineKeyboardButton(text="🖼️ 设置欢迎图片", callback_data="settings_welcome_image")],
+        [InlineKeyboardButton(text="📋 查看当前设置", callback_data="settings_show")],
+    ])
+    await message.answer("⚙️ 悦己设置中心\n━━━━━━━━━━━━━━\n请选择要调整的项目。大部分设置可直接点击完成。", reply_markup=kb)
+
+
+@dp.callback_query(F.data == "settings_home")
+async def settings_home_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎁 新用户赠送积分", callback_data="settings_start_points")],
+        [InlineKeyboardButton(text="📅 每日签到奖励", callback_data="settings_checkin")],
+        [InlineKeyboardButton(text="🛍️ 积分购买档位", callback_data="settings_buy_options")],
+        [InlineKeyboardButton(text="🎲 随机资源数量", callback_data="settings_random_count")],
+        [InlineKeyboardButton(text="✏️ 修改欢迎文案", callback_data="settings_text:welcome_text"), InlineKeyboardButton(text="💡 修改帮助文案", callback_data="settings_text:help_text")],
+        [InlineKeyboardButton(text="🖼️ 设置欢迎图片", callback_data="settings_welcome_image")],
+        [InlineKeyboardButton(text="📋 查看当前设置", callback_data="settings_show")],
+    ])
+    await callback.message.edit_text("⚙️ 悦己设置中心\n━━━━━━━━━━━━━━\n请选择要调整的项目。", reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settings_start_points")
+async def settings_start_points(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True); return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=f"{n} 积分", callback_data=f"cfgset:start_points:{n}") for n in (0, 10, 20, 50, 100)
+    ], [InlineKeyboardButton(text="↩️ 返回设置", callback_data="settings_home")]])
+    await callback.message.edit_text("🎁 请选择新用户注册时获得的初始积分：", reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settings_checkin")
+async def settings_checkin(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True); return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="固定 1 分", callback_data="cfgcheck:1:1"), InlineKeyboardButton(text="随机 1–3 分", callback_data="cfgcheck:1:3")],
+        [InlineKeyboardButton(text="随机 1–5 分", callback_data="cfgcheck:1:5"), InlineKeyboardButton(text="随机 3–10 分", callback_data="cfgcheck:3:10")],
+        [InlineKeyboardButton(text="↩️ 返回设置", callback_data="settings_home")],
+    ])
+    await callback.message.edit_text("📅 请选择每日签到奖励范围：", reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settings_buy_options")
+async def settings_buy_options(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True); return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="10 / 30 / 50 / 100", callback_data="cfgset:buy_options:10,30,50,100")],
+        [InlineKeyboardButton(text="5 / 15 / 30 / 60 / 100", callback_data="cfgset:buy_options:5,15,30,60,100")],
+        [InlineKeyboardButton(text="20 / 50 / 100 / 200", callback_data="cfgset:buy_options:20,50,100,200")],
+        [InlineKeyboardButton(text="↩️ 返回设置", callback_data="settings_home")],
+    ])
+    await callback.message.edit_text("🛍️ 请选择积分购买档位。提示：当前购买按钮仅为档位展示，真实支付尚未接入。", reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settings_random_count")
+async def settings_random_count(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True); return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=f"{n} 个", callback_data=f"cfgset:random_count:{n}") for n in (1, 3, 5, 10)
+    ], [InlineKeyboardButton(text="↩️ 返回设置", callback_data="settings_home")]])
+    await callback.message.edit_text("🎲 请选择每次随机推送的资源数量：", reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("cfgset:"))
+async def settings_set_value(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True); return
+    _, key, value = callback.data.split(":", 2)
+    if key not in ("start_points", "buy_options", "random_count"):
+        await callback.answer("不支持的设置项", show_alert=True); return
+    if key == "buy_options" and not all(x.strip().isdigit() for x in value.split(",")):
+        await callback.answer("档位格式不正确", show_alert=True); return
+    if key != "buy_options" and not value.isdigit():
+        await callback.answer("请输入数字", show_alert=True); return
+    await set_config(key, value)
+    await callback.message.edit_text(f"✅ 设置已保存\n\n{key} = {value}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ 返回设置中心", callback_data="settings_home")]]))
+    await callback.answer("保存成功")
+
+
+@dp.callback_query(F.data.startswith("cfgcheck:"))
+async def settings_set_checkin(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True); return
+    _, low, high = callback.data.split(":")
+    await set_config("checkin_min", low)
+    await set_config("checkin_max", high)
+    await callback.message.edit_text(f"✅ 签到奖励已设置为 {low}–{high} 积分。", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ 返回设置中心", callback_data="settings_home")]]))
+    await callback.answer("保存成功")
+
+
+@dp.callback_query(F.data.startswith("settings_text:"))
+async def settings_text_prompt(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True); return
+    key = callback.data.split(":", 1)[1]
+    pending_config[callback.from_user.id] = key
+    label = "欢迎文案" if key == "welcome_text" else "帮助文案"
+    await callback.message.answer(f"✏️ 请直接发送新的{label}。\n发送「取消设置」可取消。")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settings_welcome_image")
+async def settings_welcome_image(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True); return
+    pending_config[callback.from_user.id] = "welcome_image_file_id"
+    await callback.message.answer("🖼️ 请现在发送一张欢迎页图片（作为照片发送，不要作为文件）。\n发送「取消设置」可取消。")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settings_show")
+async def settings_show(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True); return
+    lines = ["📋 当前设置", "━━━━━━━━━━━━━━"]
+    for key in DEFAULT_CONFIG:
+        value = await get_config(key, DEFAULT_CONFIG[key])
+        if key == "welcome_image_file_id":
+            value = "已设置" if value else "未设置"
+        elif key in ("welcome_text", "help_text"):
+            value = value[:70] + ("…" if len(value) > 70 else "")
+        lines.append(f"• {key}: {value}")
+    await callback.message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚙️ 返回设置中心", callback_data="settings_home")]]))
+    await callback.answer()
 
 
 @dp.message(Command("add"))
@@ -225,6 +384,7 @@ async def cmd_del(message: Message):
 
 
 upload_state = {}
+pending_config = {}
 
 
 @dp.message(F.text.contains("|") & F.from_user.id == ADMIN_ID)
@@ -250,9 +410,15 @@ async def start_upload(message: Message):
 
 @dp.message(F.photo | F.video | F.document)
 async def collect_files(message: Message):
-    if message.from_user.id not in upload_state:
+    user_id = message.from_user.id
+    if is_admin(user_id) and pending_config.get(user_id) == "welcome_image_file_id" and message.photo:
+        await set_config("welcome_image_file_id", message.photo[-1].file_id)
+        pending_config.pop(user_id, None)
+        await message.answer("✅ 欢迎图片已保存！用户下次发送 /start 时即可看到图片。")
         return
-    state = upload_state[message.from_user.id]
+    if user_id not in upload_state:
+        return
+    state = upload_state[user_id]
     if message.photo:
         state["files"].append({"type": "photo", "file_id": message.photo[-1].file_id})
     elif message.video:
@@ -280,16 +446,27 @@ async def finish_upload(message: Message):
     await message.answer(f"资源「{state['title']}」上传成功")
 
 
+@dp.message(F.text.in_({"取消设置"}) & F.from_user.id == ADMIN_ID)
+async def cancel_pending_setting(message: Message):
+    if pending_config.pop(message.from_user.id, None):
+        await message.answer("已取消本次设置。")
+    else:
+        await message.answer("当前没有等待输入的设置。")
+
+
+@dp.message(F.text == "👤 我的信息")
 @dp.message(F.text == "我的信息")
 async def my_info(message: Message):
     points, spent, unlocked = await get_or_create_user(
         message.from_user.id, message.from_user.username or ""
     )
     text = (
-        f"用户名：{message.from_user.username or '未设置'}\n"
-        f"当前积分：{points}\n"
-        f"累计消费：{spent}\n"
-        f"已解锁资源：{unlocked} 个"
+        "👤 我的悦己账户\n━━━━━━━━━━━━━━\n"
+        f"🌷 用户名：{message.from_user.username or '未设置'}\n"
+        f"💎 当前积分：{points}\n"
+        f"🛍️ 累计消费：{spent} 积分\n"
+        f"🔓 已解锁资源：{unlocked} 个\n\n"
+        "✨ 继续签到或探索资源，开启你的悦己体验。"
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="查看已解锁资源", callback_data="view_unlocked")]]
@@ -297,6 +474,7 @@ async def my_info(message: Message):
     await message.answer(text, reply_markup=kb)
 
 
+@dp.message(F.text == "🎁 每日签到")
 @dp.message(F.text == "每日签到")
 async def daily_checkin(message: Message):
     user_id = message.from_user.id
@@ -306,7 +484,7 @@ async def daily_checkin(message: Message):
             "SELECT 1 FROM checkins WHERE user_id = ? AND checkin_date = ?", (user_id, today)
         ) as cursor:
             if await cursor.fetchone():
-                await message.answer("今天已经签到过了。")
+                await message.answer("🌷 今天已经签到过啦！\n明天再来签到，还可以继续领取积分。")
                 return
         cmin = int(await get_config("checkin_min", "1"))
         cmax = int(await get_config("checkin_max", "3"))
@@ -314,9 +492,10 @@ async def daily_checkin(message: Message):
         await db.execute("INSERT INTO checkins (user_id, checkin_date) VALUES (?, ?)", (user_id, today))
         await db.execute("UPDATE users SET points = points + ? WHERE user_id = ?", (reward, user_id))
         await db.commit()
-    await message.answer(f"签到成功！获得 {reward} 积分。")
+    await message.answer(f"🎉 签到成功！\n━━━━━━━━━━━━━━\n💎 本次获得：+{reward} 积分\n🌷 明天记得再来看看哦！")
 
 
+@dp.message(F.text == "🛍️ 购买积分")
 @dp.message(F.text == "购买积分")
 async def buy_points(message: Message):
     options = (await get_config("buy_options", "10,30,50,100")).split(",")
@@ -328,15 +507,17 @@ async def buy_points(message: Message):
     buttons.append([InlineKeyboardButton(text="自定义", callback_data="buy_custom")])
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     points, _, _ = await get_or_create_user(message.from_user.id, message.from_user.username or "")
-    await message.answer(f"当前积分：{points}\n请选择购买档位：", reply_markup=kb)
+    await message.answer(f"🛍️ 积分中心\n━━━━━━━━━━━━━━\n💎 当前积分：{points}\n👇 请选择一个积分档位：\n\n⚠️ 在线支付功能尚未接入。", reply_markup=kb)
 
 
+@dp.message(F.text == "💡 帮助")
 @dp.message(F.text == "帮助")
 async def help_cmd(message: Message):
     help_text = await get_config("help_text")
     await message.answer(help_text)
 
 
+@dp.message(F.text == "🎲 随机资源")
 @dp.message(F.text == "随机资源")
 async def random_resource(message: Message):
     user_id = message.from_user.id
@@ -348,17 +529,19 @@ async def random_resource(message: Message):
         ) as cursor:
             rows = await cursor.fetchall()
     if not rows:
-        await message.answer("暂无资源。")
+        await message.answer("📭 暂时还没有可展示的资源。\n请稍后再来探索，感谢你的耐心。")
         return
     for row in rows:
         rid, title, desc, img, vid, files, price = row
         text = (
-            f"【{title}】\n{desc}\n"
-            f"图片：{img} | 视频：{vid} | 文件：{files}\n"
-            f"解锁需要：{price} 积分\n你当前剩余：{points} 积分"
+            f"🌷 {title}\n━━━━━━━━━━━━━━\n"
+            f"📝 {desc or '暂无简介'}\n\n"
+            f"🖼️ 图片：{img}  |  🎬 视频：{vid}  |  📄 文件：{files}\n"
+            f"🔓 解锁价格：{price} 积分\n💎 你的余额：{points} 积分\n\n"
+            "👇 点击下方按钮解锁资源"
         )
         kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="解锁", callback_data=f"unlock_{rid}")]]
+            inline_keyboard=[[InlineKeyboardButton(text=f"🔓 解锁（{price} 积分）", callback_data=f"unlock_{rid}")]]
         )
         await message.answer(text, reply_markup=kb)
 
@@ -409,7 +592,7 @@ async def unlock_callback(callback: CallbackQuery):
         await db.commit()
     await callback.answer("解锁成功")
     await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.message.answer("解锁成功，正在发送文件...")
+    await callback.message.answer("🎉 解锁成功！\n━━━━━━━━━━━━━━\n📦 正在为你发送资源，请稍候…")
     await send_resource_files(callback.message.chat.id, file_ids)
 
 
@@ -433,7 +616,27 @@ async def view_unlocked(callback: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def buy_callback(callback: CallbackQuery):
-    await callback.answer("支付功能待接入", show_alert=True)
+    await callback.answer("积分支付功能尚未接入，请联系管理员。", show_alert=True)
+
+
+@dp.message(F.from_user.id == ADMIN_ID)
+async def handle_pending_admin_text(message: Message):
+    user_id = message.from_user.id
+    key = pending_config.get(user_id)
+    if not key or key == "welcome_image_file_id":
+        return
+    if message.text == "取消设置":
+        pending_config.pop(user_id, None)
+        await message.answer("已取消本次设置。")
+        return
+    if key not in ("welcome_text", "help_text"):
+        return
+    if not message.text or len(message.text) > 3500:
+        await message.answer("文案不能为空，且请控制在 3500 字以内。")
+        return
+    await set_config(key, message.text)
+    pending_config.pop(user_id, None)
+    await message.answer("✅ 文案已保存！\n下次用户打开对应页面时就会使用新文案。")
 
 
 async def main():
