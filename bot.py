@@ -1225,6 +1225,18 @@ async def help_cmd(message: Message):
 async def random_resource(message: Message):
     if await choose_random_source_folder(message):
         return
+    # If synced source folders exist, do not misleadingly fall back to the
+    # unrelated local resources table and claim the whole library is empty.
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM source_folders WHERE item_count > 0") as cur:
+            source_count_row = await cur.fetchone()
+    if source_count_row and int(source_count_row[0] or 0) > 0:
+        await message.answer(
+            "⚠️ 已同步到资源文件夹，但这次没能读取到至少两个可组成相册的图片/视频。"
+            "请确认悦己机器人仍在原仓库频道内且有查看权限；如果频道开启了内容保护，机器人可能无法转发预览。"
+            "本次没有发送重复文件，请稍后重试或联系管理员检查。"
+        )
+        return
     user_id = message.from_user.id
     points, _, _ = await get_or_create_user(user_id, message.from_user.username or "")
     count = int(await get_config("random_count", "3"))
