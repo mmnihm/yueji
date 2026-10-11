@@ -246,6 +246,8 @@ async def validate_config_value(key: str, value: str):
             return None, "公告最多 1000 个字符。"
         return value, None
     if key == "support_url":
+        if len(value) > 500:
+            return None, "客服链接不能超过 500 个字符。"
         if value and (not value.startswith(("https://", "http://")) or not urlparse(value).netloc):
             return None, "客服链接请填写完整的 http:// 或 https:// URL。"
         return value, None
@@ -910,14 +912,15 @@ async def cmd_start(message: Message):
     support_url = await get_config("support_url", "")
     if support_url:
         welcome += "\n\n🆘 客服：" + support_url
+    welcome = welcome[:3900]
     keyboard = await main_keyboard(message.from_user.id)
     if image_id:
         try:
             if len(welcome) <= 1024:
                 await message.answer_photo(image_id, caption=welcome, reply_markup=keyboard)
             else:
-                await message.answer_photo(image_id, caption="🌷 欢迎来到「悦己」", reply_markup=keyboard)
-                await message.answer(welcome)
+                await message.answer_photo(image_id, caption="🌷 欢迎来到「悦己」")
+                await message.answer(welcome, reply_markup=keyboard)
         except Exception:
             await message.answer(welcome, reply_markup=keyboard)
     else:
@@ -1650,7 +1653,7 @@ async def settings_set_value(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("无权限", show_alert=True); return
     _, key, value = callback.data.split(":", 2)
-    if key not in ("start_points", "buy_options", "random_count", "source_folder_price", "browse_minutes"):
+    if key not in ("start_points", "buy_options", "random_count", "source_folder_price", "browse_minutes", "daily_unlock_limit"):
         await callback.answer("不支持的设置项", show_alert=True); return
     normalized, error = await validate_config_value(key, value)
     if error:
@@ -1686,9 +1689,17 @@ async def settings_text_prompt(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("无权限", show_alert=True); return
     key = callback.data.split(":", 1)[1]
+    if key not in ("welcome_text", "help_text", "announcement_text", "support_url"):
+        await callback.answer("文案设置项无效", show_alert=True)
+        return
     pending_config[callback.from_user.id] = key
-    label = "欢迎文案" if key == "welcome_text" else "帮助文案"
-    await callback.message.answer(f"✏️ 请直接发送新的{label}。\n发送「取消设置」可取消。")
+    labels = {
+        "welcome_text": "欢迎文案",
+        "help_text": "帮助文案",
+        "announcement_text": "公告文案（发送「清空」可移除公告）",
+        "support_url": "客服链接（发送「清空」可移除客服链接）",
+    }
+    await callback.message.answer(f"✏️ 请直接发送新的{labels[key]}。\n发送「取消设置」可取消。")
     await callback.answer()
 
 
@@ -2035,6 +2046,24 @@ async def buy_callback(callback: CallbackQuery):
     await callback.answer("请按管理员提供的购买渠道获取兑换码，再点击「输入积分兑换码」。", show_alert=True)
 
 
+async def dispatch_custom_menu(message: Message):
+    text = (message.text or "").strip()
+    items = [
+        ("menu_show_my_info", "menu_my_info_text", my_info),
+        ("menu_show_checkin", "menu_checkin_text", daily_checkin),
+        ("menu_show_random", "menu_random_text", random_resource),
+        ("menu_show_buy", "menu_buy_text", buy_points),
+        ("menu_show_help", "menu_help_text", help_cmd),
+    ]
+    for show_key, text_key, handler in items:
+        label = await get_config(text_key, DEFAULT_CONFIG[text_key])
+        visible = await get_config(show_key, "1") == "1"
+        if visible and text == label:
+            await handler(message)
+            return True
+    return False
+
+
 @dp.message(F.from_user.id == ADMIN_ID)
 async def handle_pending_admin_text(message: Message):
     user_id = message.from_user.id
@@ -2043,6 +2072,8 @@ async def handle_pending_admin_text(message: Message):
         return
     key = pending_config.get(user_id)
     if not key or key == "welcome_image_file_id":
+        if not key:
+            await dispatch_custom_menu(message)
         return
     if message.text == "取消设置":
         pending_config.pop(user_id, None)
@@ -2092,14 +2123,19 @@ async def handle_pending_admin_text(message: Message):
         buttons.append([InlineKeyboardButton(text="📋 最近用户", callback_data="admin_users_clear_search")])
         await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
         return
-    if key == "browse_minutes":
-        normalized, error = await validate_config_value("browse_minutes", message.text or "")
+    if key in ("browse_minutes", "daily_unlock_limit"):
+        normalized, error = await validate_config_value(key, message.text or "")
         if error:
-            await message.answer(error + "\n请重新发送分钟数，或发送「取消设置」。")
+            await message.answer(error + "\n请重新发送数字，或发送「取消设置」。")
             return
-        await set_config("browse_minutes", normalized)
+        await set_config(key, normalized)
         pending_config.pop(user_id, None)
-        await message.answer("✅ 浏览时长已保存：" + ("不限时" if normalized == "0" else normalized + " 分钟"))
+        if key == "browse_minutes":
+            result_label = "不限时" if normalized == "0" else normalized + " 分钟"
+            await message.answer("✅ 浏览时长已保存：" + result_label)
+        else:
+            result_label = "不限量" if normalized == "0" else "每天最多 " + normalized + " 个文件夹"
+            await message.answer("✅ 每日解锁上限已保存：" + result_label)
         return
     if key == "source_repo_id":
         repo_id = (message.text or "").strip()
@@ -2110,14 +2146,33 @@ async def handle_pending_admin_text(message: Message):
         pending_config.pop(user_id, None)
         await message.answer(f"✅ 已保存原仓库频道 ID：{repo_id}\n请到「📚 资源仓库管理」点击「同步文件夹与文件」。")
         return
-    if key not in ("welcome_text", "help_text"):
+    if key in ("menu_my_info_text", "menu_checkin_text", "menu_random_text", "menu_buy_text", "menu_help_text"):
+        normalized, error = await validate_config_value(key, message.text or "")
+        if error:
+            await message.answer(error + "\n请重新发送名称，或发送「取消设置」。")
+            return
+        await set_config(key, normalized)
+        pending_config.pop(user_id, None)
+        await message.answer("✅ 菜单名称已保存。用户下次发送 /start 后会看到新名称。")
         return
-    if not message.text or len(message.text) > 3500:
-        await message.answer("文案不能为空，且请控制在 3500 字以内。")
+    if key not in ("welcome_text", "help_text", "announcement_text", "support_url"):
         return
-    await set_config(key, message.text)
+    raw_value = (message.text or "").strip()
+    if key in ("announcement_text", "support_url") and raw_value in ("清空", "关闭", "无"):
+        raw_value = ""
+    normalized, error = await validate_config_value(key, raw_value)
+    if error:
+        await message.answer(error + "\n请重新发送，或发送「取消设置」。")
+        return
+    await set_config(key, normalized)
     pending_config.pop(user_id, None)
-    await message.answer("✅ 文案已保存！\n下次用户打开对应页面时就会使用新文案。")
+    if key == "support_url":
+        result = "已清除客服链接。" if not normalized else "客服链接已保存。"
+    elif key == "announcement_text":
+        result = "已清除公告。" if not normalized else "公告已保存，用户下次发送 /start 时会看到。"
+    else:
+        result = "文案已保存！下次用户打开对应页面时就会使用新文案。"
+    await message.answer("✅ " + result)
 
 
 @dp.message(F.text)
@@ -2128,6 +2183,7 @@ async def redeem_code_message(message: Message):
         await message.answer("已取消兑换。")
         return
     if user_id not in redeem_state:
+        await dispatch_custom_menu(message)
         return
     code = (message.text or "").strip().upper().replace(" ", "")
     if not code or len(code) > 40:
