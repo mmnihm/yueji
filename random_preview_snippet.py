@@ -1,22 +1,14 @@
 async def send_source_messages(chat_id: int, rows, preview: bool = False, preview_limit: int = 3):
-    """Copy source messages in one batch when possible."""
+    """一次 batch 复制，不逐条拖延。"""
     import logging
-    from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-
     logger = logging.getLogger("yueji.copy")
-    PERMANENT = (
-        "message to copy not found", "message not found", "chat not found",
-        "have no rights", "not enough rights", "channel_private", "peer_id_invalid",
-    )
-
     pairs = []
     for row in rows:
         if not row:
             continue
-        source_chat_id, message_id = row[0], row[1]
-        if not source_chat_id or not message_id:
+        if not row[0] or not row[1]:
             continue
-        pairs.append((str(source_chat_id), int(message_id)))
+        pairs.append((str(row[0]), int(row[1])))
     if not pairs:
         return 0
     seen, ordered = set(), []
@@ -26,12 +18,10 @@ async def send_source_messages(chat_id: int, rows, preview: bool = False, previe
             ordered.append(p)
     if preview:
         ordered = ordered[: max(1, min(10, int(preview_limit or 3)))]
-
     sent = 0
     by_chat = {}
     for cid, mid in ordered:
         by_chat.setdefault(cid, []).append(mid)
-
     for source_chat_id, message_ids in by_chat.items():
         message_ids = sorted(set(message_ids))
         try:
@@ -47,7 +37,7 @@ async def send_source_messages(chat_id: int, rows, preview: bool = False, previe
                     message_ids=message_ids, protect_content=True,
                 )
                 sent += len(message_ids)
-        except Exception as exc:
+        except Exception:
             for mid in message_ids:
                 try:
                     await bot.copy_message(
@@ -63,7 +53,7 @@ async def send_source_messages(chat_id: int, rows, preview: bool = False, previe
 
 
 async def send_source_folder_card(message: Message, folder, user_id: int | None = None):
-    """先发最多3个媒体（一批），再强制发一条带完整按钮的文字卡片（按钮一定显示）。"""
+    """复制媒体（带标题），按钮挂在媒体上或紧跟极短操作条——不再重复发长文卡片。"""
     fid, name, total, images, videos, files = folder
     user_id = int(user_id or message.from_user.id)
     points, _, _ = await get_or_create_user(user_id, message.from_user.username or "")
@@ -89,113 +79,113 @@ async def send_source_folder_card(message: Message, folder, user_id: int | None 
         videos = sum(1 for r in candidates if str(r[2] or "").lower() in ("video", "animation"))
         files = max(0, total - images - videos)
 
-    card_text = (
+    title_caption = (
         f"📁 {name}\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"📦 本分组共 {total} 个文件\n"
-        f"🎬 视频/动画：{videos}\n"
-        f"🖼️ 照片：{images}\n"
-        f"📄 其他：{files}\n"
-        f"🔓 解锁：{price} 积分\n"
-        f"💎 余额：{points} 积分\n"
-    )
-    if already_unlocked:
-        card_text += "\n✅ 你已解锁此分组\n请点下方按钮操作"
-    else:
-        card_text += "\n请点下方按钮解锁或收藏"
+        f"📦 {total} 个 · 🎬{videos} 🖼️{images} · 🔓{price}积分 · 余额{points}"
+    )[:1024]
 
-    rows_kb = []
     if already_unlocked:
-        rows_kb.append([InlineKeyboardButton(
-            text="▶️ 开始浏览资源", callback_data=f"source_browse_start:{fid}",
-        )])
+        rows_kb = [
+            [InlineKeyboardButton(text="▶️ 开始浏览", callback_data=f"source_browse_start:{fid}")],
+            [InlineKeyboardButton(text="⭐ 收藏", callback_data=f"fav_toggle:{fid}"),
+             InlineKeyboardButton(text="🎲 再随机", callback_data="source_random_again")],
+        ]
     else:
-        rows_kb.append([InlineKeyboardButton(
-            text=f"🔓 解锁整个分组（{price} 积分）", callback_data=f"source_unlock:{fid}",
-        )])
-    rows_kb.append([InlineKeyboardButton(
-        text="⭐ 收藏分组", callback_data=f"fav_toggle:{fid}",
-    )])
-    rows_kb.append([InlineKeyboardButton(
-        text="🎲 再随机一个", callback_data="source_random_again",
-    )])
-    rows_kb.append([
-        InlineKeyboardButton(text="⭐ 我的收藏", callback_data="fav_list:0"),
-        InlineKeyboardButton(text="📌 最新更新", callback_data="latest_updates"),
-    ])
+        rows_kb = [
+            [InlineKeyboardButton(text=f"🔓 解锁（{price}积分）", callback_data=f"source_unlock:{fid}")],
+            [InlineKeyboardButton(text="⭐ 收藏", callback_data=f"fav_toggle:{fid}"),
+             InlineKeyboardButton(text="🎲 再随机", callback_data="source_random_again")],
+        ]
     kb = InlineKeyboardMarkup(inline_keyboard=rows_kb)
 
-    if candidates:
-        album_buckets = {}
-        for r in candidates:
-            if r[3]:
-                album_buckets.setdefault(str(r[3]), []).append(r)
-        picked = None
-        for _gid, rows in sorted(album_buckets.items(), key=lambda x: -len(x[1])):
-            if len(rows) >= 2:
-                picked = rows[:3]
-                break
-        if not picked:
-            photos = [r for r in candidates if str(r[2] or "").lower() in ("photo", "image", "picture")]
-            vids = [r for r in candidates if str(r[2] or "").lower() in ("video", "animation")]
-            others = [r for r in candidates if r not in photos and r not in vids]
-            picked = []
-            for pool in (photos, vids, others):
-                for r in pool:
-                    k = (str(r[0]), int(r[1]))
-                    if k in {(str(x[0]), int(x[1])) for x in picked}:
-                        continue
-                    picked.append(r)
-                    if len(picked) >= 3:
-                        break
+    if not candidates:
+        await message.answer(title_caption + "\n\n📭 暂无媒体", reply_markup=kb)
+        return True
+
+    album_buckets = {}
+    for r in candidates:
+        if r[3]:
+            album_buckets.setdefault(str(r[3]), []).append(r)
+    picked = None
+    for _gid, rows in sorted(album_buckets.items(), key=lambda x: -len(x[1])):
+        if len(rows) >= 2:
+            picked = rows[:3]
+            break
+    if not picked:
+        photos = [r for r in candidates if str(r[2] or "").lower() in ("photo", "image", "picture")]
+        vids = [r for r in candidates if str(r[2] or "").lower() in ("video", "animation")]
+        others = [r for r in candidates if r not in photos and r not in vids]
+        picked = []
+        for pool in (photos, vids, others):
+            for r in pool:
+                k = (str(r[0]), int(r[1]))
+                if k in {(str(x[0]), int(x[1])) for x in picked}:
+                    continue
+                picked.append(r)
                 if len(picked) >= 3:
                     break
+            if len(picked) >= 3:
+                break
 
-        if picked:
-            source_chat_id = str(picked[0][0])
-            mids = sorted({int(r[1]) for r in picked})
-            try:
-                if len(mids) == 1:
-                    await bot.copy_message(
-                        chat_id=message.chat.id,
-                        from_chat_id=source_chat_id,
-                        message_id=mids[0],
-                        protect_content=True,
-                    )
-                else:
-                    await bot.copy_messages(
-                        chat_id=message.chat.id,
-                        from_chat_id=source_chat_id,
-                        message_ids=mids,
-                        protect_content=True,
-                    )
-            except Exception:
-                for mid in mids:
-                    try:
-                        await bot.copy_message(
-                            chat_id=message.chat.id,
-                            from_chat_id=source_chat_id,
-                            message_id=mid,
-                            protect_content=True,
-                        )
-                    except Exception:
-                        pass
+    source_chat_id = str(picked[0][0])
+    mids = sorted({int(r[1]) for r in picked})
 
-    chat_id = message.chat.id
-    try:
-        await message.answer(card_text, reply_markup=kb)
-    except Exception:
+    if len(mids) == 1:
         try:
-            await bot.send_message(chat_id, card_text, reply_markup=kb)
-        except Exception as exc:
+            await bot.copy_message(
+                chat_id=message.chat.id,
+                from_chat_id=source_chat_id,
+                message_id=mids[0],
+                caption=title_caption,
+                reply_markup=kb,
+                protect_content=True,
+            )
+            return True
+        except Exception:
             try:
-                await bot.send_message(chat_id, f"操作菜单\n{exc}"[:200])
+                await bot.copy_message(
+                    chat_id=message.chat.id,
+                    from_chat_id=source_chat_id,
+                    message_id=mids[0],
+                    protect_content=True,
+                )
+            except Exception:
+                pass
+            await message.answer(title_caption, reply_markup=kb)
+            return True
+
+    first_id = None
+    try:
+        result = await bot.copy_messages(
+            chat_id=message.chat.id,
+            from_chat_id=source_chat_id,
+            message_ids=mids,
+            protect_content=True,
+        )
+        if result:
+            first = result[0]
+            first_id = getattr(first, "message_id", None) or (int(first) if isinstance(first, int) else None)
+    except Exception:
+        for mid in mids:
+            try:
+                await bot.copy_message(
+                    chat_id=message.chat.id,
+                    from_chat_id=source_chat_id,
+                    message_id=mid,
+                    protect_content=True,
+                )
             except Exception:
                 pass
 
-    if not candidates:
+    if first_id is not None:
         try:
-            await message.answer("📭 此分组暂无已索引的媒体。")
+            await bot.edit_message_caption(
+                chat_id=message.chat.id,
+                message_id=int(first_id),
+                caption=title_caption,
+            )
         except Exception:
             pass
+
+    await message.answer("请选择：", reply_markup=kb)
     return True
