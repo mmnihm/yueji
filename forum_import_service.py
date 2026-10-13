@@ -172,7 +172,7 @@ async def _notify(cb, text: str):
             pass
 
 
-async def run_forum_import(* , apply: bool = True, full_replace: bool = False,
+async def run_forum_import(*, apply: bool = True, full_replace: bool = False,
                           sync_prefs_only: bool = False, progress=None, db_path=None):
     global _import_running
     if _import_lock.locked() or _import_running:
@@ -201,29 +201,73 @@ async def run_forum_import(* , apply: bool = True, full_replace: bool = False,
                 raise RuntimeError("目标不是论坛群，请检查 FORUM_CHAT_ID。")
             forum_title = getattr(entity, "title", "") or str(FORUM_CHAT_ID)
 
-            topics, offset_topic, seen = [], 0, set()
+            # Full pagination: offset_topic + top_message id/date, honor API count
+            topics, seen = [], set()
+            offset_topic, offset_id, offset_date = 0, 0, 0
+            api_count = None
+            stagnant = 0
             while True:
                 try:
                     result = await client(GetForumTopicsRequest(
-                        peer=entity, q="", offset_date=0, offset_id=0,
-                        offset_topic=offset_topic, limit=100,
+                        peer=entity,
+                        q="",
+                        offset_date=offset_date,
+                        offset_id=offset_id,
+                        offset_topic=offset_topic,
+                        limit=100,
                     ))
                 except FloodWaitError as e:
                     await asyncio.sleep(e.seconds + 1)
                     continue
+                if api_count is None:
+                    api_count = int(getattr(result, "count", 0) or 0)
                 page = list(getattr(result, "topics", []) or [])
                 if not page:
                     break
+                msg_by_id = {}
+                for m in (getattr(result, "messages", None) or []):
+                    mid = getattr(m, "id", None)
+                    if mid is not None:
+                        msg_by_id[int(mid)] = m
                 fresh = [t for t in page if int(t.id) not in seen]
+                if not fresh:
+                    stagnant += 1
+                    if stagnant >= 3:
+                        break
+                else:
+                    stagnant = 0
                 topics.extend(fresh)
                 seen.update(int(t.id) for t in fresh)
-                if len(page) < 100 or not fresh:
+                last = page[-1]
+                offset_topic = int(last.id)
+                top_mid = int(getattr(last, "top_message", 0) or 0)
+                offset_id = top_mid
+                top_msg = msg_by_id.get(top_mid)
+                if top_msg is not None and getattr(top_msg, "date", None):
+                    d = top_msg.date
+                    offset_date = int(d.timestamp()) if hasattr(d, "timestamp") else int(d)
+                else:
+                    offset_date = 0
+                await _notify(
+                    progress,
+                    f"📋 已读取话题 {len(topics)}"
+                    + (f" / 接口声明 {api_count}" if api_count else "")
+                    + " …",
+                )
+                if api_count and len(topics) >= api_count:
                     break
-                offset_topic = int(page[-1].id)
-                await asyncio.sleep(0.25)
+                if len(page) < 100 and not fresh:
+                    break
+                await asyncio.sleep(0.35)
 
             stats["topics_total"] = len(topics)
-            await _notify(progress, f"📋 论坛「{forum_title}」共 {len(topics)} 个话题，正在筛选…")
+            stats["api_topic_count"] = api_count or 0
+            msg = f"📋 论坛「{forum_title}」扫描到 {len(topics)} 个话题"
+            if api_count:
+                msg += f"（接口 count={api_count}）"
+            if api_count and len(topics) < api_count:
+                msg += "\n⚠️ 仍少于接口声明数量，可能有隐藏/无权限话题。"
+            await _notify(progress, msg + "，正在筛选…")
 
             async with aiosqlite.connect(path) as db:
                 await ensure_schema(db)
@@ -242,7 +286,7 @@ async def run_forum_import(* , apply: bool = True, full_replace: bool = False,
 
                 if sync_prefs_only:
                     await _notify(progress, f"✅ 话题列表已刷新：{len(topics)} 个。可在「论坛话题选择」里排除。")
-                    return {"topics_total": len(topics), "sync_prefs_only": True}
+                    return {"topics_total": len(topics), "sync_prefs_only": True, "api_topic_count": api_count}
 
                 accepted = []
                 for t in topics:
@@ -262,7 +306,7 @@ async def run_forum_import(* , apply: bool = True, full_replace: bool = False,
                     topics_total=stats["topics_total"], topics_imported=0, topics_skipped=stats["topics_skipped"],
                     topics_failed=0, resources_total=0, resources_new=0, resources_skipped=0,
                     video_count=0, photo_count=0, album_groups=0, file_count=0, last_error=None,
-                    detail=json.dumps({"mode": mode}, ensure_ascii=False))
+                    detail=json.dumps({"mode": mode, "api_count": api_count}, ensure_ascii=False))
 
                 if full_replace:
                     await db.execute("BEGIN IMMEDIATE")
