@@ -1,12 +1,10 @@
 async def send_source_messages(chat_id: int, rows, preview: bool = False, preview_limit: int = 3):
-    """一次 batch 复制，不逐条拖延。"""
+    """一次 batch 复制。"""
     import logging
     logger = logging.getLogger("yueji.copy")
     pairs = []
     for row in rows:
-        if not row:
-            continue
-        if not row[0] or not row[1]:
+        if not row or not row[0] or not row[1]:
             continue
         pairs.append((str(row[0]), int(row[1])))
     if not pairs:
@@ -53,7 +51,9 @@ async def send_source_messages(chat_id: int, rows, preview: bool = False, previe
 
 
 async def send_source_folder_card(message: Message, folder, user_id: int | None = None):
-    """复制媒体（带标题），按钮挂在媒体上或紧跟极短操作条——不再重复发长文卡片。"""
+    """美观卡片：原消息标题 + 作者备注；单文件标题与按钮同一条；多文件相册优先挂第一张。"""
+    import json as _json
+
     fid, name, total, images, videos, files = folder
     user_id = int(user_id or message.from_user.id)
     points, _, _ = await get_or_create_user(user_id, message.from_user.username or "")
@@ -62,7 +62,7 @@ async def send_source_folder_card(message: Message, folder, user_id: int | None 
 
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            """SELECT chat_id, message_id, file_type, grouped_id
+            """SELECT chat_id, message_id, file_type, grouped_id, title, data
                FROM source_resources WHERE folder_id=? ORDER BY message_id""",
             (str(fid),),
         ) as cur:
@@ -79,28 +79,21 @@ async def send_source_folder_card(message: Message, folder, user_id: int | None 
         videos = sum(1 for r in candidates if str(r[2] or "").lower() in ("video", "animation"))
         files = max(0, total - images - videos)
 
-    title_caption = (
-        f"📁 {name}\n"
-        f"📦 {total} 个 · 🎬{videos} 🖼️{images} · 🔓{price}积分 · 余额{points}"
-    )[:1024]
+    def _orig_title(row) -> str:
+        t = (row[4] or "").strip() if len(row) > 4 else ""
+        return t[:200] if t else ""
 
-    if already_unlocked:
-        rows_kb = [
-            [InlineKeyboardButton(text="▶️ 开始浏览", callback_data=f"source_browse_start:{fid}")],
-            [InlineKeyboardButton(text="⭐ 收藏", callback_data=f"fav_toggle:{fid}"),
-             InlineKeyboardButton(text="🎲 再随机", callback_data="source_random_again")],
-        ]
-    else:
-        rows_kb = [
-            [InlineKeyboardButton(text=f"🔓 解锁（{price}积分）", callback_data=f"source_unlock:{fid}")],
-            [InlineKeyboardButton(text="⭐ 收藏", callback_data=f"fav_toggle:{fid}"),
-             InlineKeyboardButton(text="🎲 再随机", callback_data="source_random_again")],
-        ]
-    kb = InlineKeyboardMarkup(inline_keyboard=rows_kb)
-
-    if not candidates:
-        await message.answer(title_caption + "\n\n📭 暂无媒体", reply_markup=kb)
-        return True
+    def _author_from_row(row) -> str:
+        raw = row[5] if len(row) > 5 else None
+        if raw:
+            try:
+                d = _json.loads(raw) if isinstance(raw, str) else (raw or {})
+                for k in ("author", "author_name", "topic_title", "from", "channel"):
+                    if d.get(k):
+                        return str(d[k]).strip()[:80]
+            except Exception:
+                pass
+        return (name or "").strip()[:80]
 
     album_buckets = {}
     for r in candidates:
@@ -111,7 +104,7 @@ async def send_source_folder_card(message: Message, folder, user_id: int | None 
         if len(rows) >= 2:
             picked = rows[:3]
             break
-    if not picked:
+    if not picked and candidates:
         photos = [r for r in candidates if str(r[2] or "").lower() in ("photo", "image", "picture")]
         vids = [r for r in candidates if str(r[2] or "").lower() in ("video", "animation")]
         others = [r for r in candidates if r not in photos and r not in vids]
@@ -127,6 +120,41 @@ async def send_source_folder_card(message: Message, folder, user_id: int | None 
             if len(picked) >= 3:
                 break
 
+    main_title = _orig_title(picked[0]) if picked else ""
+    if not main_title:
+        main_title = (name or "资源").strip()[:200]
+    author = _author_from_row(picked[0]) if picked else (name or "")
+    lines = [f"【{main_title}】"]
+    if author and author not in main_title:
+        lines.append(f"👤 作者：{author}")
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append(f"📦 共 {total} 个文件 · 🎬{videos} 🖼️{images}")
+    lines.append(f"🔓 {price} 积分 · 余额 {points}")
+    if already_unlocked:
+        lines.append("✅ 已解锁")
+    card_caption = "\n".join(lines)[:1024]
+
+    if already_unlocked:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="▶️ 开始浏览", callback_data=f"source_browse_start:{fid}")],
+            [
+                InlineKeyboardButton(text="⭐ 收藏", callback_data=f"fav_toggle:{fid}"),
+                InlineKeyboardButton(text="🎲 再随机", callback_data="source_random_again"),
+            ],
+        ])
+    else:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"🔓 解锁（{price}积分）", callback_data=f"source_unlock:{fid}")],
+            [
+                InlineKeyboardButton(text="⭐ 收藏", callback_data=f"fav_toggle:{fid}"),
+                InlineKeyboardButton(text="🎲 再随机", callback_data="source_random_again"),
+            ],
+        ])
+
+    if not picked:
+        await message.answer(card_caption + "\n\n📭 暂无媒体", reply_markup=kb)
+        return True
+
     source_chat_id = str(picked[0][0])
     mids = sorted({int(r[1]) for r in picked})
 
@@ -136,7 +164,7 @@ async def send_source_folder_card(message: Message, folder, user_id: int | None 
                 chat_id=message.chat.id,
                 from_chat_id=source_chat_id,
                 message_id=mids[0],
-                caption=title_caption,
+                caption=card_caption,
                 reply_markup=kb,
                 protect_content=True,
             )
@@ -151,7 +179,7 @@ async def send_source_folder_card(message: Message, folder, user_id: int | None 
                 )
             except Exception:
                 pass
-            await message.answer(title_caption, reply_markup=kb)
+            await message.answer(card_caption, reply_markup=kb)
             return True
 
     first_id = None
@@ -164,7 +192,9 @@ async def send_source_folder_card(message: Message, folder, user_id: int | None 
         )
         if result:
             first = result[0]
-            first_id = getattr(first, "message_id", None) or (int(first) if isinstance(first, int) else None)
+            first_id = getattr(first, "message_id", None) or (
+                int(first) if isinstance(first, int) else None
+            )
     except Exception:
         for mid in mids:
             try:
@@ -182,10 +212,19 @@ async def send_source_folder_card(message: Message, folder, user_id: int | None 
             await bot.edit_message_caption(
                 chat_id=message.chat.id,
                 message_id=int(first_id),
-                caption=title_caption,
+                caption=card_caption,
+                reply_markup=kb,
             )
+            return True
         except Exception:
-            pass
+            try:
+                await bot.edit_message_caption(
+                    chat_id=message.chat.id,
+                    message_id=int(first_id),
+                    caption=card_caption,
+                )
+            except Exception:
+                pass
 
-    await message.answer("请选择：", reply_markup=kb)
+    await message.answer(card_caption, reply_markup=kb)
     return True
