@@ -105,8 +105,8 @@ async def main():
     env.update({k: v for k, v in dotenv_values("/root/telegram-forward-bot/.env").items() if v})
     env.update({k: v for k, v in os.environ.items() if v})
     try:
-        api_id = int(env.get("API_ID") or env.get("TELEGRAM_API_ID") or "")
-        api_hash = str(env.get("API_HASH") or env.get("TELEGRAM_API_HASH") or "")
+        api_id = int(env.get("API_ID") or env.get("TELEGRAM_API_ID") or env.get("TG_API_ID") or "")
+        api_hash = str(env.get("API_HASH") or env.get("TELEGRAM_API_HASH") or env.get("TG_API_HASH") or "")
     except ValueError:
         raise SystemExit("找不到有效的 API_ID/API_HASH，请在本机环境配置；不要把密钥发给他人。")
     if not api_hash:
