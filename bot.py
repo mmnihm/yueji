@@ -506,7 +506,7 @@ async def send_source_folder_card(message: Message, folder, user_id: int | None 
     price = max(0, int(price_value if price_value is not None else 10))
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT chat_id, message_id, file_type, file_id, data, grouped_id FROM source_resources WHERE folder_id=? ORDER BY message_id",
+            "SELECT chat_id, message_id, file_type, file_id, data FROM source_resources WHERE folder_id=? ORDER BY message_id",
             (str(fid),),
         ) as cur:
             candidates = await cur.fetchall()
