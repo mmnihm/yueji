@@ -87,12 +87,13 @@ async def get_topics(client, entity):
 
 async def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--list-topics", action="store_true", help="list forum topic IDs and titles without changing the database")
     parser.add_argument("--apply", action="store_true", help="replace resource index after scanning")
     args = parser.parse_args()
-    if not ALLOWLIST_RAW:
+    if not ALLOWLIST_RAW and not args.list_topics:
         raise SystemExit(
-            "安全保护：尚未设置 FORUM_TOPIC_ALLOWLIST。请先审查论坛主题列表，"
-            "再只填入确认属于合规成年内容/普通内容的 topic ID；本程序不会默认导入全部主题。"
+            "安全保护：尚未设置 FORUM_TOPIC_ALLOWLIST。先运行 --list-topics 审查主题，"
+            "再只填写确认合规的主题 ID；本程序不会默认导入全部主题。"
         )
     try:
         allowlist = {int(x.strip()) for x in ALLOWLIST_RAW.split(",") if x.strip()}
@@ -118,9 +119,17 @@ async def main():
         if not getattr(entity, "forum", False):
             raise SystemExit("指定频道不是 Telegram 论坛，请检查 FORUM_CHAT_ID。")
         topics = await get_topics(client, entity)
+        print(f"论坛：{getattr(entity, 'title', '')} | 主题总数：{len(topics)}")
+        if args.list_topics:
+            for topic in topics:
+                title = str(getattr(topic, "title", "") or f"主题 {topic.id}")
+                status = "【需排除】" if blocked(title) else "【需人工审查】"
+                print(f"{int(topic.id)}\t{status}\t{title}")
+            print("只将人工确认合规的主题 ID 放入 FORUM_TOPIC_ALLOWLIST；本次未修改数据库。")
+            return
         chosen = [t for t in topics if int(t.id) in allowlist]
         unknown = sorted(allowlist - {int(t.id) for t in topics})
-        print(f"论坛：{getattr(entity, 'title', '')} | 主题总数：{len(topics)} | 允许列表命中：{len(chosen)}")
+        print(f"允许列表命中：{len(chosen)}")
         if unknown:
             print("警告：以下 ID 未找到，将忽略：" + ",".join(map(str, unknown)))
 
