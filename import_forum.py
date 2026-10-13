@@ -17,7 +17,7 @@ from pathlib import Path
 import aiosqlite
 from dotenv import dotenv_values
 from telethon import TelegramClient
-from telethon.tl.functions.channels import GetForumTopicsRequest
+from telethon.tl.functions.messages import GetForumTopicsRequest
 from telethon.tl.types import DocumentAttributeAnimated, DocumentAttributeVideo
 
 ROOT = Path(__file__).resolve().parent
@@ -70,7 +70,7 @@ async def get_topics(client, entity):
     seen = set()
     while True:
         result = await client(GetForumTopicsRequest(
-            channel=entity, q="", offset_date=None, offset_id=0,
+            peer=entity, q="", offset_date=0, offset_id=0,
             offset_topic=offset_topic, limit=100,
         ))
         page = list(getattr(result, "topics", []) or [])
