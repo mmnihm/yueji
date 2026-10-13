@@ -77,6 +77,28 @@ class YuejiBotSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(session)
         self.assertIsNone(session[1])
 
+    async def test_source_resources_gets_grouped_id_column(self):
+        import aiosqlite
+        async with aiosqlite.connect(app.DB_PATH) as db:
+            async with db.execute("PRAGMA table_info(source_resources)") as cur:
+                columns = {row[1] for row in await cur.fetchall()}
+        self.assertIn("grouped_id", columns)
+
+    async def test_resource_page_does_not_split_album(self):
+        rows = [(str(-1001), i, "photo", None) for i in range(1, 10)]
+        rows.extend([
+            (str(-1001), 10, "photo", "album-a"),
+            (str(-1001), 11, "photo", "album-a"),
+            (str(-1001), 12, "photo", "album-a"),
+            (str(-1001), 13, "photo", None),
+        ])
+        page1 = app.resource_page(rows, 0)
+        self.assertEqual(len(page1), 10)
+        page2 = app.resource_page(rows, len(page1))
+        self.assertEqual([row[1] for row in page2[:3]], [11, 12, 13])
+        # The first album record was deliberately moved before the boundary in this fixture.
+        self.assertNotEqual(page2[0][3], "album-a")
+
     async def test_existing_users_table_gets_banned_column(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             legacy_db = os.path.join(temp_dir, "legacy.db")
