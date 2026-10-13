@@ -479,21 +479,23 @@ async def send_source_messages(chat_id: int, rows, preview: bool = False):
         message_ids = sorted(set(message_ids))
         if preview:
             message_ids = message_ids[:1]
-        for start in range(0, len(message_ids), 10 if not preview else 1):
-            batch = message_ids[start:start + (10 if not preview else 1)]
-            try:
-                await bot.copy_messages(
-                    chat_id=chat_id,
-                    from_chat_id=source_chat_id,
-                    message_ids=batch,
-                    protect_content=True,
-                )
-                sent += len(batch)
-            except Exception as exc:
-                if preview:
-                    raise RuntimeError("预览文件发送失败，请确认悦己机器人已加入原仓库且有读取权限：" + str(exc)[:250])
-                print("Source resource batch copy error:", str(exc)[:200])
-                continue
+        # resource_page already keeps album groups intact. Its page can exceed
+        # 10 records only by the remainder of one album (Telegram albums max 10),
+        # so copy the complete page in one call rather than splitting an album at
+        # the internal 10-message chunk boundary.
+        batch = message_ids[:1] if preview else message_ids
+        try:
+            await bot.copy_messages(
+                chat_id=chat_id,
+                from_chat_id=source_chat_id,
+                message_ids=batch,
+                protect_content=True,
+            )
+            sent += len(batch)
+        except Exception as exc:
+            if preview:
+                raise RuntimeError("预览文件发送失败，请确认悦己机器人已加入原仓库且有读取权限：" + str(exc)[:250])
+            print("Source resource batch copy error:", str(exc)[:200])
     return sent
 
 
