@@ -149,7 +149,7 @@ async def main():
         counts = defaultdict(lambda: {"all": 0, "image": 0, "video": 0, "file": 0})
         for topic in accepted:
             topic_id = int(topic.id)
-            folder_id = f"forum:{topic_id}"
+            folder_id = f"forum_{topic_id}"
             title = str(getattr(topic, "title", "") or f"主题 {topic_id}").strip()[:250]
             folder_rows.append((folder_id, title))
             messages = []
