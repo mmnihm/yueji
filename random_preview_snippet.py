@@ -1,5 +1,5 @@
 async def send_source_messages(chat_id: int, rows, preview: bool = False, preview_limit: int = 3):
-    """Copy source messages. Prefer batch by chat; permanent errors skip without infinite retry."""
+    """Copy source messages. Prefer batch; permanent errors skip without infinite retry."""
     import logging
     import asyncio
     from aiogram.exceptions import (
@@ -78,7 +78,6 @@ async def send_source_messages(chat_id: int, rows, preview: bool = False, previe
 
     async def _copy_one(source_chat_id: str, mid: int, max_attempts: int = 2, **kwargs) -> bool:
         nonlocal sent, skipped_permanent
-        last_exc = None
         for attempt in range(1, max_attempts + 1):
             try:
                 await bot.copy_message(
@@ -91,12 +90,9 @@ async def send_source_messages(chat_id: int, rows, preview: bool = False, previe
                 sent += 1
                 return True
             except TelegramRetryAfter as e:
-                wait = min(int(getattr(e, "retry_after", 3) or 3), 15)
-                await asyncio.sleep(wait)
-                last_exc = e
+                await asyncio.sleep(min(int(getattr(e, "retry_after", 3) or 3), 15))
                 continue
             except Exception as e2:
-                last_exc = e2
                 if _is_permanent(e2):
                     skipped_permanent += 1
                     logger.warning(
@@ -129,7 +125,7 @@ async def send_source_messages(chat_id: int, rows, preview: bool = False, previe
                 batch_ok = True
             except Exception as exc:
                 logger.info(
-                    "copy_messages batch failed chat=%s n=%s err=%s → fallback single",
+                    "copy_messages batch failed chat=%s n=%s err=%s → fallback",
                     source_chat_id, len(message_ids), str(exc)[:160],
                 )
         if not batch_ok:
@@ -139,14 +135,14 @@ async def send_source_messages(chat_id: int, rows, preview: bool = False, previe
 
     if preview and sent == 0:
         raise RuntimeError(
-            "预览文件发送失败，请确认悦己机器人已加入源频道且有读取权限"
-            + (f"（已跳过永久错误 {skipped_permanent} 条）" if skipped_permanent else "")
+            "预览发送失败，请确认机器人已加入源频道且有读取权限"
+            + (f"（跳过 {skipped_permanent} 条）" if skipped_permanent else "")
         )
     return sent
 
 
 async def send_source_folder_card(message: Message, folder, user_id: int | None = None):
-    """以「卡片」形式展示分组：封面媒体 + 标题/数量/价格 + 按钮（不再先丢一堆零散文件）。"""
+    """随机分组卡片：一次发最多 3 个文件，文字说明和按钮写在第一张上。"""
     fid, name, total, images, videos, files = folder
     user_id = int(user_id or message.from_user.id)
     points, _, _ = await get_or_create_user(user_id, message.from_user.username or "")
@@ -186,6 +182,10 @@ async def send_source_folder_card(message: Message, folder, user_id: int | None 
         f"🔓 解锁：{price} 积分\n"
         f"💎 余额：{points} 积分"
     )
+    if already_unlocked:
+        card_text += "\n\n✅ 你已解锁此分组"
+    else:
+        card_text += "\n\n点击下方按钮解锁后可浏览全部"
 
     fav_on = False
     try:
@@ -201,12 +201,7 @@ async def send_source_folder_card(message: Message, folder, user_id: int | None 
         if latest_block:
             card_text += "\n\n" + latest_block
     except Exception:
-        fav_on = False
-
-    if already_unlocked:
-        card_text += "\n\n✅ 你已解锁此分组"
-    else:
-        card_text += "\n\n点击下方按钮解锁后可浏览全部"
+        pass
 
     fav_btn = InlineKeyboardButton(
         text="💔 取消收藏" if fav_on else "⭐ 收藏分组",
@@ -247,68 +242,104 @@ async def send_source_folder_card(message: Message, folder, user_id: int | None 
             ]
         )
 
-    cover = None
-    if candidates:
-        photos = [
-            r
-            for r in candidates
-            if str(r[2] or "").lower() in ("photo", "image", "picture")
-        ]
-        vids = [
-            r
-            for r in candidates
-            if str(r[2] or "").lower() in ("video", "animation")
-        ]
-        for pool in (photos, vids, candidates):
-            if pool:
-                cover = pool[0]
-                break
-
-    card_sent = False
-    if cover:
-        source_chat_id, message_id = str(cover[0]), int(cover[1])
-        try:
-            await bot.copy_message(
-                chat_id=message.chat.id,
-                from_chat_id=source_chat_id,
-                message_id=message_id,
-                caption=card_text[:1024],
-                reply_markup=kb,
-                protect_content=True,
-            )
-            card_sent = True
-        except Exception as exc:
-            try:
-                await message.answer(card_text, reply_markup=kb)
-                card_sent = True
-            except Exception:
-                pass
-            try:
-                await message.answer("⚠️ 封面预览失败：" + str(exc)[:150])
-            except Exception:
-                pass
-
-    if not card_sent:
+    if not candidates:
         await message.answer(card_text, reply_markup=kb)
-
-    if candidates and cover:
-        extra = []
-        cover_key = (str(cover[0]), int(cover[1]))
-        for r in candidates:
-            key = (str(r[0]), int(r[1]))
-            if key == cover_key:
-                continue
-            extra.append(key)
-            if len(extra) >= 2:
-                break
-        if extra:
-            try:
-                await send_source_messages(
-                    message.chat.id, extra, preview=True, preview_limit=2
-                )
-            except Exception:
-                pass
-    elif not candidates:
         await message.answer("📭 此分组暂无已索引的媒体，请管理员重新扫描导入。")
+        return True
+
+    photos = [r for r in candidates if str(r[2] or "").lower() in ("photo", "image", "picture")]
+    vids = [r for r in candidates if str(r[2] or "").lower() in ("video", "animation")]
+    others = [r for r in candidates if r not in photos and r not in vids]
+    picked = []
+    for pool in (photos, vids, others, candidates):
+        for r in pool:
+            key = (str(r[0]), int(r[1]))
+            if key in {(str(x[0]), int(x[1])) for x in picked}:
+                continue
+            picked.append(r)
+            if len(picked) >= 3:
+                break
+        if len(picked) >= 3:
+            break
+
+    by_chat: dict = {}
+    for r in picked:
+        by_chat.setdefault(str(r[0]), []).append(int(r[1]))
+
+    caption = card_text[:1024]
+    ok = False
+
+    for source_chat_id, mids in by_chat.items():
+        mids = sorted(set(mids))
+        if len(mids) >= 1:
+            try:
+                if len(mids) > 1:
+                    result = await bot.copy_messages(
+                        chat_id=message.chat.id,
+                        from_chat_id=source_chat_id,
+                        message_ids=mids,
+                        protect_content=True,
+                    )
+                    first_id = None
+                    if result:
+                        first = result[0]
+                        first_id = getattr(first, "message_id", None) or (
+                            first if isinstance(first, int) else None
+                        )
+                    if first_id is not None:
+                        try:
+                            await bot.edit_message_caption(
+                                chat_id=message.chat.id,
+                                message_id=int(first_id),
+                                caption=caption,
+                                reply_markup=kb,
+                            )
+                            ok = True
+                            break
+                        except Exception:
+                            await message.answer(caption, reply_markup=kb)
+                            ok = True
+                            break
+                else:
+                    await bot.copy_message(
+                        chat_id=message.chat.id,
+                        from_chat_id=source_chat_id,
+                        message_id=mids[0],
+                        caption=caption,
+                        reply_markup=kb,
+                        protect_content=True,
+                    )
+                    ok = True
+                    break
+            except Exception:
+                try:
+                    await bot.copy_message(
+                        chat_id=message.chat.id,
+                        from_chat_id=source_chat_id,
+                        message_id=mids[0],
+                        caption=caption,
+                        reply_markup=kb,
+                        protect_content=True,
+                    )
+                    for mid in mids[1:3]:
+                        try:
+                            await bot.copy_message(
+                                chat_id=message.chat.id,
+                                from_chat_id=source_chat_id,
+                                message_id=mid,
+                                protect_content=True,
+                            )
+                        except Exception:
+                            pass
+                    ok = True
+                    break
+                except Exception as exc:
+                    await message.answer(caption, reply_markup=kb)
+                    await message.answer("⚠️ 预览媒体失败：" + str(exc)[:150])
+                    ok = True
+                    break
+
+    if not ok:
+        await message.answer(caption, reply_markup=kb)
 
     return True
