@@ -157,6 +157,8 @@ async def init_db():
             existing_columns = {row[1] for row in await cur.fetchall()}
         if "file_id" not in existing_columns:
             await db.execute("ALTER TABLE source_resources ADD COLUMN file_id TEXT")
+        if "grouped_id" not in existing_columns:
+            await db.execute("ALTER TABLE source_resources ADD COLUMN grouped_id TEXT")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_source_resources_folder ON source_resources(folder_id)")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS source_folder_unlocks (
@@ -398,6 +400,8 @@ async def source_repository_status():
 
 
 async def sync_source_repository():
+    if await get_config("source_provider", "mysql") == "telegram_forum":
+        raise RuntimeError("当前资源来源是 Telegram 论坛。为防止旧 MySQL 同步清空论坛索引，已阻止本次旧仓库同步。")
     repo_id = await detect_source_repository()
     if not repo_id:
         raise RuntimeError("已连接 MySQL，但没能自动识别仓库频道 ID。请点击「手动绑定」后发送频道 ID（通常以 -100 开头）。")
@@ -441,11 +445,12 @@ async def sync_source_repository():
             folder_map[fid] = True
         for key, folder_id, chat_id, message_id, title, file_type, file_id, raw in resource_rows:
             await db.execute(
-                "INSERT OR REPLACE INTO source_resources (resource_key, folder_id, chat_id, message_id, title, file_type, file_id, data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (str(key), str(folder_id or ""), str(chat_id), int(message_id or 0), str(title or ""), str(file_type or ""), str(file_id or ""), str(raw or "{}")),
+                "INSERT OR REPLACE INTO source_resources (resource_key, folder_id, chat_id, message_id, title, file_type, file_id, data, grouped_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(key), str(folder_id or ""), str(chat_id), int(message_id or 0), str(title or ""), str(file_type or ""), str(file_id or ""), str(raw or "{}"), None),
             )
         await db.commit()
     await set_config("source_repo_id", repo_id)
+    await set_config("source_provider", "mysql")
     return {"repo_id": repo_id, "folders": len(folder_rows), "resources": len(resource_rows)}
 
 
@@ -501,7 +506,7 @@ async def send_source_folder_card(message: Message, folder, user_id: int | None 
     price = max(0, int(price_value if price_value is not None else 10))
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT chat_id, message_id, file_type, file_id, data FROM source_resources WHERE folder_id=? ORDER BY message_id",
+            "SELECT chat_id, message_id, file_type, file_id, data, grouped_id FROM source_resources WHERE folder_id=? ORDER BY message_id",
             (str(fid),),
         ) as cur:
             candidates = await cur.fetchall()
@@ -682,9 +687,22 @@ def browse_start_keyboard(fid: str):
     ]])
 
 
+def resource_page(rows, offset: int, limit: int = 10):
+    """Return up to limit message records without splitting a Telegram album."""
+    if offset < 0 or offset >= len(rows):
+        return []
+    end = min(offset + limit, len(rows))
+    if end < len(rows) and end > offset:
+        last_group = rows[end - 1][3] if len(rows[end - 1]) > 3 else None
+        if last_group:
+            while end < len(rows) and len(rows[end]) > 3 and rows[end][3] == last_group:
+                end += 1
+    return rows[offset:end]
+
+
 async def send_browse_page_summary(message: Message, fid: str, rows, offset: int, sent: int, skipped_video_batch: bool = False):
     total = len(rows)
-    next_offset = min(offset + 10, total)
+    next_offset = min(offset + len(resource_page(rows, offset)), total)
     remaining = max(0, total - next_offset)
     if skipped_video_batch:
         note = "⏱️ 浏览时限已结束，本批包含视频，已跳过该批。其他不含视频的批次仍可继续。"
@@ -804,7 +822,7 @@ async def source_browse_start(callback: CallbackQuery):
         ) as cur:
             unlocked = await cur.fetchone()
         async with db.execute(
-            "SELECT chat_id, message_id, file_type FROM source_resources WHERE folder_id=? ORDER BY message_id",
+            "SELECT chat_id, message_id, file_type, grouped_id FROM source_resources WHERE folder_id=? ORDER BY message_id",
             (fid,),
         ) as cur:
             rows = await cur.fetchall()
@@ -848,7 +866,7 @@ async def source_browse_start(callback: CallbackQuery):
         await callback.message.edit_text(f"▶️ 已开始浏览文件夹。\n{time_text}\n时间到后，已发送内容不会撤回。")
     except Exception:
         await callback.message.answer(f"▶️ 已开始浏览文件夹。\n{time_text}")
-    first_page = rows[:10]
+    first_page = resource_page(rows, 0)
     sent = await send_source_messages(callback.message.chat.id, [(r[0], r[1]) for r in first_page])
     await send_browse_page_summary(callback.message, fid, rows, 0, sent)
 
@@ -870,7 +888,7 @@ async def source_folder_more(callback: CallbackQuery):
         ) as cur:
             unlocked = await cur.fetchone()
         async with db.execute(
-            "SELECT chat_id, message_id, file_type FROM source_resources WHERE folder_id=? ORDER BY message_id",
+            "SELECT chat_id, message_id, file_type, grouped_id FROM source_resources WHERE folder_id=? ORDER BY message_id",
             (fid,),
         ) as cur:
             rows = await cur.fetchall()
@@ -883,7 +901,7 @@ async def source_folder_more(callback: CallbackQuery):
 
     expired = await browse_session_expired(user_id, fid)
     scope = await get_config("browse_scope", "all")
-    page = rows[offset:offset + 10]
+    page = resource_page(rows, offset)
     has_video = any(any(kind in str(row[2] or "").lower() for kind in ("video", "animation")) for row in page)
     if expired and scope != "videos":
         await callback.answer("浏览时限已结束，无法继续发送该文件夹资源。", show_alert=True)
@@ -1078,6 +1096,22 @@ async def source_repo_manage(callback: CallbackQuery):
         await callback.answer("无权限", show_alert=True)
         return
     repo_id = str(await get_config("source_repo_id", "") or "").strip()
+    if await get_config("source_provider", "mysql") == "telegram_forum":
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT COUNT(*) FROM source_folders") as cur:
+                folder_count = int((await cur.fetchone())[0] or 0)
+            async with db.execute("SELECT COUNT(*) FROM source_resources") as cur:
+                resource_count = int((await cur.fetchone())[0] or 0)
+        await callback.message.edit_text(
+            "📚 资源仓库管理\n━━━━━━━━━━━━━━\n"
+            "🟢 当前来源：Telegram 论坛\n"
+            f"📁 已导入主题：{folder_count} 个\n"
+            f"📦 已导入消息：{resource_count} 条\n\n"
+            "旧 MySQL 同步已被保护性禁用，避免覆盖论坛索引。",
+            reply_markup=await source_repository_keyboard(),
+        )
+        await callback.answer()
+        return
     state = await source_repository_status()
     if state["ok"]:
         status_text = (
