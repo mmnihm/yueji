@@ -142,7 +142,7 @@ async def send_source_messages(chat_id: int, rows, preview: bool = False, previe
 
 
 async def send_source_folder_card(message: Message, folder, user_id: int | None = None):
-    """随机分组卡片：一次发最多 3 个文件，文字说明和按钮写在第一张上。"""
+    """最多 3 个预览媒体 + 固定一条带按钮的文字卡片（按钮一定显示）。"""
     fid, name, total, images, videos, files = folder
     user_id = int(user_id or message.from_user.id)
     points, _, _ = await get_or_create_user(user_id, message.from_user.username or "")
@@ -267,79 +267,42 @@ async def send_source_folder_card(message: Message, folder, user_id: int | None 
         by_chat.setdefault(str(r[0]), []).append(int(r[1]))
 
     caption = card_text[:1024]
-    ok = False
 
+    media_ok = False
     for source_chat_id, mids in by_chat.items():
-        mids = sorted(set(mids))
-        if len(mids) >= 1:
-            try:
-                if len(mids) > 1:
-                    result = await bot.copy_messages(
-                        chat_id=message.chat.id,
-                        from_chat_id=source_chat_id,
-                        message_ids=mids,
-                        protect_content=True,
-                    )
-                    first_id = None
-                    if result:
-                        first = result[0]
-                        first_id = getattr(first, "message_id", None) or (
-                            first if isinstance(first, int) else None
-                        )
-                    if first_id is not None:
-                        try:
-                            await bot.edit_message_caption(
-                                chat_id=message.chat.id,
-                                message_id=int(first_id),
-                                caption=caption,
-                                reply_markup=kb,
-                            )
-                            ok = True
-                            break
-                        except Exception:
-                            await message.answer(caption, reply_markup=kb)
-                            ok = True
-                            break
-                else:
-                    await bot.copy_message(
-                        chat_id=message.chat.id,
-                        from_chat_id=source_chat_id,
-                        message_id=mids[0],
-                        caption=caption,
-                        reply_markup=kb,
-                        protect_content=True,
-                    )
-                    ok = True
-                    break
-            except Exception:
+        mids = sorted(set(mids))[:3]
+        try:
+            if len(mids) > 1:
+                await bot.copy_messages(
+                    chat_id=message.chat.id,
+                    from_chat_id=source_chat_id,
+                    message_ids=mids,
+                    protect_content=True,
+                )
+            else:
+                await bot.copy_message(
+                    chat_id=message.chat.id,
+                    from_chat_id=source_chat_id,
+                    message_id=mids[0],
+                    protect_content=True,
+                )
+            media_ok = True
+        except Exception:
+            for mid in mids:
                 try:
                     await bot.copy_message(
                         chat_id=message.chat.id,
                         from_chat_id=source_chat_id,
-                        message_id=mids[0],
-                        caption=caption,
-                        reply_markup=kb,
+                        message_id=mid,
                         protect_content=True,
                     )
-                    for mid in mids[1:3]:
-                        try:
-                            await bot.copy_message(
-                                chat_id=message.chat.id,
-                                from_chat_id=source_chat_id,
-                                message_id=mid,
-                                protect_content=True,
-                            )
-                        except Exception:
-                            pass
-                    ok = True
-                    break
-                except Exception as exc:
-                    await message.answer(caption, reply_markup=kb)
-                    await message.answer("⚠️ 预览媒体失败：" + str(exc)[:150])
-                    ok = True
-                    break
+                    media_ok = True
+                except Exception:
+                    pass
 
-    if not ok:
-        await message.answer(caption, reply_markup=kb)
+    # 固定发文字+按钮（媒体组/复制消息上挂键盘经常不显示）
+    await message.answer(caption, reply_markup=kb)
+    if not media_ok:
+        await message.answer("⚠️ 预览媒体未能发送，请确认机器人对源频道有读取权限。")
 
     return True
