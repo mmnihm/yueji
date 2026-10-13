@@ -1,3 +1,1 @@
-import asyncio
-# truncated for test - will fail if too long - use real content from local
-print('placeholder')
+SEE_LOCAL_FILE_TOO_LARGE_USE_IMPORT_FORUM_MAIN_CHANGE
