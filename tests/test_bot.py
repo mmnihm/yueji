@@ -77,6 +77,11 @@ class YuejiBotSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(session)
         self.assertIsNone(session[1])
 
+    async def test_forum_provider_blocks_destructive_mysql_sync(self):
+        await app.set_config("source_provider", "telegram_forum")
+        with self.assertRaisesRegex(RuntimeError, "阻止本次旧仓库同步"):
+            await app.sync_source_repository()
+
     async def test_source_resources_gets_grouped_id_column(self):
         import aiosqlite
         async with aiosqlite.connect(app.DB_PATH) as db:
