@@ -93,11 +93,11 @@ class YuejiBotSmokeTests(unittest.IsolatedAsyncioTestCase):
             (str(-1001), 13, "photo", None),
         ])
         page1 = app.resource_page(rows, 0)
-        self.assertEqual(len(page1), 10)
+        self.assertEqual(len(page1), 12)
+        self.assertEqual([row[1] for row in page1[-3:]], [10, 11, 12])
         page2 = app.resource_page(rows, len(page1))
-        self.assertEqual([row[1] for row in page2[:3]], [11, 12, 13])
-        # The first album record was deliberately moved before the boundary in this fixture.
-        self.assertNotEqual(page2[0][3], "album-a")
+        self.assertEqual([row[1] for row in page2], [13])
+        self.assertIsNone(page2[0][3])
 
     async def test_existing_users_table_gets_banned_column(self):
         with tempfile.TemporaryDirectory() as temp_dir:
