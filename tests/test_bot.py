@@ -130,6 +130,46 @@ class YuejiBotSmokeTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 app.DB_PATH = original_path
 
+    async def test_import_status_summary_without_table(self):
+        text = await app.get_import_status_summary()
+        self.assertIn("尚无导入记录", text)
+
+    async def test_import_status_summary_with_data(self):
+        import aiosqlite
+        async with aiosqlite.connect(app.DB_PATH) as db:
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS import_status (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    started_at TEXT,
+                    finished_at TEXT,
+                    status TEXT,
+                    topics_total INTEGER DEFAULT 0,
+                    topics_imported INTEGER DEFAULT 0,
+                    topics_skipped INTEGER DEFAULT 0,
+                    topics_failed INTEGER DEFAULT 0,
+                    resources_total INTEGER DEFAULT 0,
+                    resources_new INTEGER DEFAULT 0,
+                    resources_skipped INTEGER DEFAULT 0,
+                    video_count INTEGER DEFAULT 0,
+                    photo_count INTEGER DEFAULT 0,
+                    album_groups INTEGER DEFAULT 0,
+                    file_count INTEGER DEFAULT 0,
+                    last_error TEXT,
+                    detail TEXT
+                )
+            """)
+            await db.execute("""
+                INSERT OR REPLACE INTO import_status
+                (id, status, topics_total, topics_imported, topics_skipped, topics_failed,
+                 resources_total, resources_new, video_count, photo_count)
+                VALUES (1, 'completed', 100, 90, 8, 2, 5000, 1200, 300, 400)
+            """)
+            await db.commit()
+        text = await app.get_import_status_summary()
+        self.assertIn("completed", text)
+        self.assertIn("90", text)
+        self.assertIn("1200", text)
+
 
 if __name__ == "__main__":
     unittest.main()
