@@ -1144,6 +1144,7 @@ async def source_repo_auto(callback: CallbackQuery):
             await callback.message.answer("没有自动识别到仓库频道，请点击「手动绑定频道 ID」。")
         else:
             await set_config("source_repo_id", repo_id)
+            await set_config("source_provider", "mysql")
             await callback.message.answer(f"✅ 已识别并绑定原仓库频道：{repo_id}\n接下来点击「同步文件夹与文件」。")
     except Exception as exc:
         await callback.message.answer("❌ 连接原资源库失败：\n" + str(exc)[:700])
@@ -1183,6 +1184,21 @@ async def source_repo_sync(callback: CallbackQuery):
 async def source_repo_status(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("无权限", show_alert=True)
+        return
+    if await get_config("source_provider", "mysql") == "telegram_forum":
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT COUNT(*) FROM source_folders") as cur:
+                folder_count = int((await cur.fetchone())[0] or 0)
+            async with db.execute("SELECT COUNT(*) FROM source_resources") as cur:
+                resource_count = int((await cur.fetchone())[0] or 0)
+        await callback.message.answer(
+            "📊 当前资源状态\n━━━━━━━━━━━━━━\n"
+            "🟢 来源：Telegram 论坛\n"
+            f"📁 主题目录：{folder_count} 个\n"
+            f"📦 媒体消息：{resource_count} 条\n"
+            "🔒 旧 MySQL 同步已禁用，避免覆盖论坛数据。"
+        )
+        await callback.answer()
         return
     state = await source_repository_status()
     if state["ok"]:
@@ -2296,6 +2312,7 @@ async def handle_pending_admin_text(message: Message):
             await message.answer("频道 ID 格式不正确，请发送数字频道 ID（通常以 -100 开头），或发送「取消设置」。")
             return
         await set_config("source_repo_id", repo_id)
+        await set_config("source_provider", "mysql")
         pending_config.pop(user_id, None)
         await message.answer(f"✅ 已保存原仓库频道 ID：{repo_id}\n请到「📚 资源仓库管理」点击「同步文件夹与文件」。")
         return
