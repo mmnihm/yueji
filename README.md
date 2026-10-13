@@ -11,7 +11,8 @@
 - 用户菜单名称可修改，菜单按钮可单独隐藏/显示并调整顺序；积分档位支持预设或自定义。
 - 欢迎文案、帮助文案、公告、客服链接、欢迎图片可在后台管理。
 - 管理员可将 SQLite 数据库备份发送到自己的 Telegram 私聊。
-- 原资源仓库 MySQL 连接、频道绑定及资源索引同步功能保留。
+- 原资源仓库 MySQL 连接、频道绑定及资源索引同步功能保留；导入 Telegram 论坛后会自动阻止旧 MySQL 同步覆盖论坛索引。
+- Telegram 论坛索引导入工具 `import_forum.py`：仅索引消息 ID，不下载媒体；默认预览，必须手动设置已审查的主题 ID 白名单后才能导入。主题名称或说明中触发未成年人、偷拍、泄露等风险词的内容会跳过。
 
 ## 安装与运行
 1. 安装依赖：`pip install -r requirements.txt`
@@ -29,3 +30,14 @@
 
 ## 自动检查
 GitHub Actions 会执行 Python 语法检查和 SQLite 配置/迁移烟雾测试。部署前仍应在测试机器人中验证 Telegram 实际按钮、原仓库频道权限和资源分页表现。
+
+
+## Telegram 论坛资源导入（管理员手动执行）
+
+1. 在服务器安装依赖：`pip install -r requirements.txt`。
+2. 确认本机已有可访问目标论坛的 Telethon session，并在环境变量中配置 `API_ID`、`API_HASH`；不要提交 session 或密钥到仓库。
+3. 先使用 `python import_forum.py --list-topics` 查看主题 ID 和标题。
+4. 仅把人工审查后确认合规、成年且非泄露/非偷拍的主题 ID 写入 `FORUM_TOPIC_ALLOWLIST`，多个 ID 用逗号分隔。
+5. 先运行 `python import_forum.py` 预览数量；确认后才运行 `python import_forum.py --apply`。应用时只替换资源索引及旧解锁/浏览会话，不删除用户、积分、签到、兑换码和机器人配置。
+
+注意：主题标题/说明关键词过滤不是对媒体内容的完整审核；不得把涉及未成年人、非自愿私密影像或来源不明泄露内容的主题加入白名单。
