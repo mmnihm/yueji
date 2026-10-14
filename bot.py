@@ -484,18 +484,17 @@ async def fetch_random_photo_post(fid: str):
 
 
 async def send_source_folder_card(message: Message, folder, user_id: int | None = None):
-    """Pick one random topic, then send one complete original photo post/album with title only."""
+    """Send a complete random photo post, then show its title with the existing action buttons."""
     if BOT is None:
         await message.answer("机器人尚未初始化，请稍后再试。")
         return False
     fid, folder_name = str(folder[0]), str(folder[1])
+    uid = int(user_id or (message.from_user.id if message.from_user else 0))
     resources = await fetch_random_photo_post(fid)
     if not resources:
         await message.answer("这个话题暂时没有纯图片帖子可发送。")
         return False
 
-    # Keep every photo in the original album together. The source album's grouped_id
-    # identifies the complete post; copy_messages preserves Telegram media grouping.
     source_chat = str(resources[0][2])
     message_ids = sorted({int(row[3]) for row in resources})
     _, title = resource_labels(resources[0], folder_name)
@@ -510,18 +509,36 @@ async def send_source_folder_card(message: Message, folder, user_id: int | None 
             await message.answer("这条图片帖子发送失败，请稍后再试。")
             return False
 
-        # Replace any long/source caption with the post title only, without adding
-        # a separate title message. Telegram permits editing the first album caption.
-        first = copied[0]
-        if title:
-            try:
-                await BOT.edit_message_caption(
-                    chat_id=message.chat.id,
-                    message_id=first.message_id,
-                    caption=title[:1024],
-                )
-            except Exception as exc:
-                log.warning("随机图片标题更新失败 folder=%s: %s", fid, str(exc)[:140])
+        # Keep the album itself clean; put the title and working controls in one
+        # separate, compact message because Telegram media groups cannot carry a keyboard.
+        try:
+            await BOT.edit_message_caption(
+                chat_id=message.chat.id,
+                message_id=copied[0].message_id,
+                caption="",
+            )
+        except Exception as exc:
+            log.info("清除原帖图片说明未成功（可能原本没有说明）: %s", str(exc)[:100])
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT 1 FROM source_folder_unlocks WHERE user_id=? AND source_folder_id=?",
+                (uid, fid),
+            ) as cur:
+                unlocked = bool(await cur.fetchone())
+            async with db.execute(
+                "SELECT 1 FROM favorites WHERE user_id=? AND source_folder_id=?",
+                (uid, fid),
+            ) as cur:
+                favorite = bool(await cur.fetchone())
+            async with db.execute(
+                "SELECT expires_at FROM memberships WHERE user_id=?",
+                (uid,),
+            ) as cur:
+                membership = await cur.fetchone()
+        member_active = bool(membership and (membership[0] is None or membership[0] > now_iso()))
+        price = 0 if member_active else max(0, int(await get_config("unlock_price", "10") or 0))
+        await message.answer(title[:1024], reply_markup=folder_keyboard(fid, unlocked, favorite, price))
         return True
     except Exception as exc:
         log.warning("随机图片帖子发送失败 folder=%s: %s", fid, str(exc)[:180])
