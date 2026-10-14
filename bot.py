@@ -944,12 +944,12 @@ async def admin_toggle(callback: CallbackQuery):
         await callback.message.edit_text("🧩 用户菜单设置已更新。", reply_markup=await menu_settings_keyboard())
     else:
         text = (
-            "⚙️ 浏览与解锁设置\\n"
-            f"浏览时限：{await get_config('browse_minutes','5')} 分钟（0=不限时）\\n"
-            f"到期限制：{await get_config('browse_scope','all')}\\n"
-            f"管理员免时限：{await get_config('browse_admin_exempt','1')}\\n"
-            f"解锁价格：{await get_config('unlock_price','10')} 积分\\n"
-            f"每日解锁上限：{await get_config('daily_unlock_limit','0')}（0=不限）\\n"
+            "⚙️ 浏览与解锁设置\n"
+            f"浏览时限：{await get_config('browse_minutes','5')} 分钟（0=不限时）\n"
+            f"到期限制：{await get_config('browse_scope','all')}\n"
+            f"管理员免时限：{await get_config('browse_admin_exempt','1')}\n"
+            f"解锁价格：{await get_config('unlock_price','10')} 积分\n"
+            f"每日解锁上限：{await get_config('daily_unlock_limit','0')}（0=不限）\n"
             f"每日视频上限：{await get_config('daily_video_limit','0')}（0=不限）"
         )
         await callback.message.edit_text(text, reply_markup=await settings_keyboard())
