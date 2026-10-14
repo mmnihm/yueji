@@ -334,17 +334,10 @@ async def fetch_random_folder_resources(fid: str, limit: int = 3):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             """SELECT title,data,chat_id,message_id,file_type,grouped_id
-               FROM source_resources AS r
-               WHERE folder_id=? AND (
-                   grouped_id IS NULL OR grouped_id='' OR message_id=(
-                       SELECT MIN(r2.message_id) FROM source_resources AS r2
-                       WHERE r2.folder_id=r.folder_id
-                         AND r2.chat_id=r.chat_id
-                         AND r2.grouped_id=r.grouped_id
-                   )
-               )
+               FROM source_resources
+               WHERE folder_id=? AND LOWER(file_type) IN ('photo','image')
                ORDER BY RANDOM() LIMIT ?""",
-            (fid, max(1, int(limit))),
+            (fid, max(1, min(int(limit), 3))),
         ) as cur:
             return await cur.fetchall()
 
@@ -368,38 +361,19 @@ def resource_labels(resource_info, folder_name: str):
 
 
 async def send_random_resource_preview(chat_id: int, fid: str, resource_info) -> int:
-    """Send one actual file or its entire album group; never split a selected album."""
+    """Send a selected photo with its title as the caption, without extra text messages."""
     if BOT is None:
         raise RuntimeError("机器人尚未初始化")
     if not resource_info:
-        raise RuntimeError("这个话题没有可预览的资源")
-    _, _, source_chat, message_id, _, grouped_id = resource_info
-    source_chat = str(source_chat)
-    if grouped_id:
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute(
-                """SELECT message_id FROM source_resources
-                   WHERE folder_id=? AND chat_id=? AND grouped_id=?
-                   ORDER BY message_id""",
-                (fid, source_chat, str(grouped_id)),
-            ) as cur:
-                message_ids = [int(row[0]) for row in await cur.fetchall()]
-        if not message_ids:
-            message_ids = [int(message_id)]
-        if len(message_ids) > 1:
-            sent = await BOT.copy_messages(
-                chat_id=chat_id, from_chat_id=source_chat,
-                message_ids=message_ids, protect_content=True,
-            )
-            return len(sent or [])
-        await BOT.copy_message(
-            chat_id=chat_id, from_chat_id=source_chat,
-            message_id=int(message_ids[0]), protect_content=True,
-        )
-        return 1
+        raise RuntimeError("这个话题没有可预览的图片")
+    title, raw_data, source_chat, message_id, _, _ = resource_info
+    _, caption = resource_labels(resource_info, "")
     await BOT.copy_message(
-        chat_id=chat_id, from_chat_id=source_chat,
-        message_id=int(message_id), protect_content=True,
+        chat_id=chat_id,
+        from_chat_id=str(source_chat),
+        message_id=int(message_id),
+        caption=caption or str(title or "图片"),
+        protect_content=True,
     )
     return 1
 
@@ -471,9 +445,7 @@ async def send_source_folder_card(message: Message, folder, user_id: int | None 
     preview_count = 0
     preview_errors = []
     for idx, resource_info in enumerate(resources, 1):
-        _, resource_title = resource_labels(resource_info, str(folder[1]))
         try:
-            await message.answer(f"📝 第 {idx} 个文件：{resource_title}")
             await send_random_resource_preview(message.chat.id, fid, resource_info)
             preview_count += 1
         except Exception as exc:
@@ -507,7 +479,7 @@ async def choose_random_source_folder(message: Message, user_id: int | None = No
     if not folder:
         await message.answer("资源仓库还没有话题，请管理员先导入资源。")
         return False
-    await message.answer("🎲 已随机选中 1 个话题，从该话题中随机抽取最多 3 个文件，每个文件附带标题。")
+    await message.answer("🎲 已随机选中 1 个话题，正在发送其中随机抽取的最多 3 张图片。")
     await send_source_folder_card(message, folder, user_id=user_id)
     return True
 
