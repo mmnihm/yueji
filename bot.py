@@ -364,12 +364,12 @@ async def build_folder_card(fid: str, user_id: int):
         files = sum(1 for kind, _ in kinds if kind not in ("photo", "image", "video", "animation"))
     price = max(0, int(await get_config("unlock_price", "10") or 0))
     text = (
-        f"📁 {name}\\n━━━━━━━━━━━━━━\\n"
-        f"🎬 视频消息：{videos} 个\\n"
-        f"🖼️ 相册组：{len(album_ids)} 组\\n"
-        f"📄 其他文件：{files} 个\\n"
-        f"📦 资源记录：{count} 条\\n"
-        f"🔐 状态：{'已解锁' if unlocked else f'需要 {price} 积分解锁'}\\n"
+        f"📁 {name}\n━━━━━━━━━━━━━━\n"
+        f"🎬 视频消息：{videos} 个\n"
+        f"🖼️ 相册组：{len(album_ids)} 组\n"
+        f"📄 其他文件：{files} 个\n"
+        f"📦 资源记录：{count} 条\n"
+        f"🔐 状态：{'已解锁' if unlocked else f'需要 {price} 积分解锁'}\n"
         "👇 点击下方按钮继续"
     )
     return text, folder_keyboard(str(fid), unlocked, favorite, price)
@@ -421,7 +421,7 @@ async def list_source_folders(message: Message, page: int = 0, edit: CallbackQue
         if nav:
             buttons.append(nav)
         buttons.append([InlineKeyboardButton(text="🎲 随机推荐", callback_data="source_random_again")])
-        text = f"📚 资源文件夹（第 {page+1}/{max(1,(total+page_size-1)//page_size)} 页）\\n点击文件夹查看详情、解锁和浏览。"
+        text = f"📚 资源文件夹（第 {page+1}/{max(1,(total+page_size-1)//page_size)} 页）\n点击文件夹查看详情、解锁和浏览。"
         kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     if edit:
         try:
@@ -489,9 +489,49 @@ async def send_browse_page_summary(message: Message, fid: str, rows, offset: int
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text=f"📦 继续发送（剩余 {remaining} 条）", callback_data=f"source_more:{fid}:{next_offset}")
         ]])
-        await message.answer(f"{note}\\n剩余 {remaining} 条，点击下方继续。", reply_markup=kb)
+        await message.answer(f"{note}\n剩余 {remaining} 条，点击下方继续。", reply_markup=kb)
     else:
-        await message.answer(f"{note}\\n✅ 该文件夹已到最后一批。")
+        await message.answer(f"{note}\n✅ 该文件夹已到最后一批。")
+
+
+async def apply_video_quota(user_id: int, rows):
+    """Return a quota-safe page without splitting album groups, plus video message count."""
+    limit = max(0, int(await get_config("daily_video_limit", "0") or 0))
+    if limit == 0 or is_admin(user_id):
+        return list(rows), sum(1 for r in rows if str(r[2] or "") in ("video", "animation"))
+    today = datetime.now().date().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT video_count FROM browse_usage WHERE user_id=? AND usage_date=?", (user_id, today)) as cur:
+            row = await cur.fetchone()
+    remaining = max(0, limit - (int(row[0]) if row else 0))
+    allowed, i, videos_used = [], 0, 0
+    while i < len(rows):
+        row = rows[i]
+        group = row[3] if len(row) > 3 else None
+        chunk = [row]
+        j = i + 1
+        if group:
+            while j < len(rows) and len(rows[j]) > 3 and rows[j][3] == group:
+                chunk.append(rows[j])
+                j += 1
+        video_count = sum(1 for item in chunk if str(item[2] or "") in ("video", "animation"))
+        if video_count == 0 or videos_used + video_count <= remaining:
+            allowed.extend(chunk)
+            videos_used += video_count
+        i = j if group else i + 1
+    return allowed, videos_used
+
+
+async def record_video_usage(user_id: int, count: int) -> None:
+    if count <= 0:
+        return
+    today = datetime.now().date().isoformat()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO browse_usage(user_id,usage_date,video_count) VALUES(?,?,?)
+            ON CONFLICT(user_id,usage_date) DO UPDATE SET video_count=video_count+excluded.video_count
+        """, (user_id, today, count))
+        await db.commit()
 
 
 async def fetch_folder_resources(fid: str):
@@ -515,8 +555,8 @@ async def show_user_info(message: Message):
         async with db.execute("SELECT COUNT(*) FROM favorites WHERE user_id=?", (uid,)) as cur:
             favorites = int((await cur.fetchone())[0] or 0)
     await message.answer(
-        f"👤 我的信息\\n━━━━━━━━━━━━━━\\n🆔 ID：{uid}\\n💎 积分：{row[0] if row else 0}\\n"
-        f"🔓 已解锁：{row[2] if row else 0} 个文件夹\\n⭐ 收藏：{favorites} 个\\n"
+        f"👤 我的信息\n━━━━━━━━━━━━━━\n🆔 ID：{uid}\n💎 积分：{row[0] if row else 0}\n"
+        f"🔓 已解锁：{row[2] if row else 0} 个文件夹\n⭐ 收藏：{favorites} 个\n"
         f"📅 注册时间：{(row[3] or '')[:10] if row else '—'}",
         reply_markup=await reply_menu(),
     )
@@ -538,7 +578,7 @@ async def handle_checkin(message: Message):
         await db.execute("UPDATE users SET points=points+? WHERE user_id=?", (reward, uid))
         await db.execute("INSERT INTO points_log(user_id,amount,reason) VALUES(?,?,?)", (uid, reward, "每日签到"))
         await db.commit()
-    await message.answer(f"🎉 签到成功，获得 {reward} 积分！\\n当前积分：{await user_points(uid)}")
+    await message.answer(f"🎉 签到成功，获得 {reward} 积分！\n当前积分：{await user_points(uid)}")
 
 
 async def show_buy_options(message: Message):
@@ -546,7 +586,7 @@ async def show_buy_options(message: Message):
     options = [int(x) for x in raw.split(",") if x.strip().isdigit()]
     buttons = [[InlineKeyboardButton(text=f"兑换 {n} 积分", callback_data=f"buy_points:{n}")] for n in options]
     buttons.append([InlineKeyboardButton(text="🎟️ 使用兑换码", callback_data="redeem_prompt")])
-    await message.answer("💎 积分中心\\n\\n当前支持管理员发放兑换码。选择积分档位查看兑换说明，暂未接入在线支付。", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await message.answer("💎 积分中心\n\n当前支持管理员发放兑换码。选择积分档位查看兑换说明，暂未接入在线支付。", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
 async def admin_keyboard() -> InlineKeyboardMarkup:
@@ -600,7 +640,7 @@ async def start(message: Message):
         return
     welcome = await get_config("welcome_text", DEFAULTS["welcome_text"])
     announcement = await get_config("announcement_text", "")
-    await message.answer(welcome + (f"\\n\\n📣 {announcement}" if announcement else ""), reply_markup=await reply_menu())
+    await message.answer(welcome + (f"\n\n📣 {announcement}" if announcement else ""), reply_markup=await reply_menu())
 
 
 @dp.message(Command("help"))
@@ -706,10 +746,13 @@ async def source_unlock(callback: CallbackQuery):
         else:
             limit = max(0, int(await get_config("daily_unlock_limit", "0") or 0))
             price = max(0, int(await get_config("unlock_price", "10") or 0))
-            if limit and await daily_unlock_count(uid) >= limit:
-                await db.rollback()
-                await callback.answer(f"今天最多解锁 {limit} 个文件夹", show_alert=True)
-                return
+            if limit:
+                async with db.execute("SELECT COUNT(*) FROM source_folder_unlocks WHERE user_id=? AND date(unlocked_at)=date('now')", (uid,)) as cur:
+                    today_count = int((await cur.fetchone())[0] or 0)
+                if today_count >= limit:
+                    await db.rollback()
+                    await callback.answer(f"今天最多解锁 {limit} 个文件夹", show_alert=True)
+                    return
             async with db.execute("SELECT points FROM users WHERE user_id=?", (uid,)) as cur:
                 row = await cur.fetchone()
             points = int(row[0]) if row else 0
@@ -759,15 +802,20 @@ async def source_browse_start(callback: CallbackQuery):
     time_text = "不限时" if minutes == 0 or exempt else f"{minutes} 分钟"
     await callback.answer("开始浏览")
     try:
-        await callback.message.edit_text(f"▶️ 已开始浏览\\n浏览时限：{time_text}\\n已发送的内容不会在计时结束后撤回。")
+        await callback.message.edit_text(f"▶️ 已开始浏览\n浏览时限：{time_text}\n已发送的内容不会在计时结束后撤回。")
     except Exception:
-        await callback.message.answer(f"▶️ 已开始浏览\\n浏览时限：{time_text}")
+        await callback.message.answer(f"▶️ 已开始浏览\n浏览时限：{time_text}")
     page = resource_page(rows, 0)
+    page, video_count = await apply_video_quota(uid, page)
+    if not page:
+        await send_browse_page_summary(callback.message, fid, rows, 0, 0, skipped_video_batch=True)
+        return
     try:
         sent = await send_source_messages(callback.message.chat.id, page)
+        await record_video_usage(uid, video_count)
         await send_browse_page_summary(callback.message, fid, rows, 0, sent)
     except PartialSendError as exc:
-        await callback.message.answer(f"⚠️ 发送过程发生错误，已确认成功发送 {exc.sent} 条。为防止重复，机器人没有自动重发。请先检查已收到的文件后再联系管理员。\\n错误：{str(exc)[:160]}")
+        await callback.message.answer(f"⚠️ 发送过程发生错误，已确认成功发送 {exc.sent} 条。为防止重复，机器人没有自动重发。请先检查已收到的文件后再联系管理员。\n错误：{str(exc)[:160]}")
 
 
 @dp.callback_query(F.data.startswith("source_more:"))
@@ -803,11 +851,16 @@ async def source_folder_more(callback: CallbackQuery):
     if expired and scope == "videos" and contains_video:
         await send_browse_page_summary(callback.message, fid, rows, offset, 0, skipped_video_batch=True)
         return
+    page, video_count = await apply_video_quota(uid, page)
+    if not page:
+        await send_browse_page_summary(callback.message, fid, rows, offset, 0, skipped_video_batch=True)
+        return
     try:
         sent = await send_source_messages(callback.message.chat.id, page)
+        await record_video_usage(uid, video_count)
         await send_browse_page_summary(callback.message, fid, rows, offset, sent)
     except PartialSendError as exc:
-        await callback.message.answer(f"⚠️ 发送中断，已确认发送 {exc.sent} 条。为避免重复未自动重试，请先检查上方已收到的文件。\\n错误：{str(exc)[:160]}")
+        await callback.message.answer(f"⚠️ 发送中断，已确认发送 {exc.sent} 条。为避免重复未自动重试，请先检查上方已收到的文件。\n错误：{str(exc)[:160]}")
 
 
 async def browse_session_exists(uid: int, fid: str) -> bool:
@@ -829,9 +882,11 @@ async def buy_points_info(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "redeem_prompt")
 async def redeem_prompt(callback: CallbackQuery):
-    SEARCH_WAITING.add(callback.from_user.id)
-    # Dedicated marker; the next plain-text message is interpreted as a code only if prefixed.
-    await callback.answer("请发送：兑换码 ABC123", show_alert=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (f"pending_redeem:{callback.from_user.id}", "1"))
+        await db.commit()
+    await callback.answer("请发送兑换码", show_alert=True)
+    await callback.message.answer("请直接发送兑换码，或发送：兑换码 ABC123")
 
 
 @dp.callback_query(F.data == "admin_home")
@@ -849,12 +904,12 @@ async def admin_browse_settings(callback: CallbackQuery):
         await callback.answer("无权限", show_alert=True)
         return
     text = (
-        "⚙️ 浏览与解锁设置\\n"
-        f"浏览时限：{await get_config('browse_minutes','5')} 分钟（0=不限时）\\n"
-        f"到期限制：{await get_config('browse_scope','all')}\\n"
-        f"管理员免时限：{await get_config('browse_admin_exempt','1')}\\n"
-        f"解锁价格：{await get_config('unlock_price','10')} 积分\\n"
-        f"每日解锁上限：{await get_config('daily_unlock_limit','0')}（0=不限）\\n"
+        "⚙️ 浏览与解锁设置\n"
+        f"浏览时限：{await get_config('browse_minutes','5')} 分钟（0=不限时）\n"
+        f"到期限制：{await get_config('browse_scope','all')}\n"
+        f"管理员免时限：{await get_config('browse_admin_exempt','1')}\n"
+        f"解锁价格：{await get_config('unlock_price','10')} 积分\n"
+        f"每日解锁上限：{await get_config('daily_unlock_limit','0')}（0=不限）\n"
         f"每日视频上限：{await get_config('daily_video_limit','0')}（0=不限）"
     )
     await callback.answer()
@@ -867,7 +922,7 @@ async def admin_menu_settings(callback: CallbackQuery):
         await callback.answer("无权限", show_alert=True)
         return
     await callback.answer()
-    await callback.message.edit_text("🧩 用户菜单设置\\n可修改菜单名称、顺序、欢迎文案、帮助文案、公告和客服链接。", reply_markup=await menu_settings_keyboard())
+    await callback.message.edit_text("🧩 用户菜单设置\n可修改菜单名称、顺序、欢迎文案、帮助文案、公告和客服链接。", reply_markup=await menu_settings_keyboard())
 
 
 @dp.callback_query(F.data.startswith("admin_toggle:"))
@@ -888,7 +943,16 @@ async def admin_toggle(callback: CallbackQuery):
     if key == "menu_show_random":
         await callback.message.edit_text("🧩 用户菜单设置已更新。", reply_markup=await menu_settings_keyboard())
     else:
-        await admin_browse_settings(callback)
+        text = (
+            "⚙️ 浏览与解锁设置\\n"
+            f"浏览时限：{await get_config('browse_minutes','5')} 分钟（0=不限时）\\n"
+            f"到期限制：{await get_config('browse_scope','all')}\\n"
+            f"管理员免时限：{await get_config('browse_admin_exempt','1')}\\n"
+            f"解锁价格：{await get_config('unlock_price','10')} 积分\\n"
+            f"每日解锁上限：{await get_config('daily_unlock_limit','0')}（0=不限）\\n"
+            f"每日视频上限：{await get_config('daily_video_limit','0')}（0=不限）"
+        )
+        await callback.message.edit_text(text, reply_markup=await settings_keyboard())
 
 
 @dp.callback_query(F.data.startswith("admin_set:"))
@@ -920,9 +984,9 @@ async def admin_set_prompt(callback: CallbackQuery):
     }.get(key, "请输入新的设置值。")
     SEARCH_WAITING.add(callback.from_user.id)
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=value", (f"pending_admin:{callback.from_user.id}", key))
+        await db.execute("INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (f"pending_admin:{callback.from_user.id}", key))
         await db.commit()
-    await callback.message.answer(f"{prompt}\\n设置项：{key}\\n保存后请重新打开菜单。")
+    await callback.message.answer(f"{prompt}\n设置项：{key}\n保存后请重新打开菜单。")
 
 
 @dp.callback_query(F.data == "admin_stats")
@@ -938,7 +1002,7 @@ async def admin_stats(callback: CallbackQuery):
         async with db.execute("SELECT COUNT(*) FROM source_resources") as cur:
             resources = int((await cur.fetchone())[0] or 0)
     await callback.answer()
-    await callback.message.answer(f"📊 统计\\n用户：{users}\\n用户积分总额：{points}\\n文件夹：{folders}\\n资源记录：{resources}\\n论坛导入：{await get_import_status_summary()}")
+    await callback.message.answer(f"📊 统计\n用户：{users}\n用户积分总额：{points}\n文件夹：{folders}\n资源记录：{resources}\n论坛导入：{await get_import_status_summary()}")
 
 
 @dp.callback_query(F.data == "admin_code_prompt")
@@ -948,7 +1012,7 @@ async def admin_code_prompt(callback: CallbackQuery):
         return
     SEARCH_WAITING.add(callback.from_user.id)
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=value", (f"pending_admin:{callback.from_user.id}", "create_code"))
+        await db.execute("INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (f"pending_admin:{callback.from_user.id}", "create_code"))
         await db.commit()
     await callback.answer()
     await callback.message.answer("请发送兑换码积分数，例如 30。机器人会生成一个兑换码。")
@@ -1003,7 +1067,7 @@ async def text_router(message: Message):
                     await db.execute("DELETE FROM config WHERE key=?", (pending_key,))
                     await db.commit()
                 SEARCH_WAITING.discard(uid)
-                await message.answer(f"兑换码已生成：\\n<code>{code}</code>\\n额度：{amount} 积分\\n请仅发给已付款用户。")
+                await message.answer(f"兑换码已生成：\n<code>{code}</code>\n额度：{amount} 积分\n请仅发给已付款用户。")
                 return
             if raw == "-":
                 raw = ""
@@ -1018,8 +1082,15 @@ async def text_router(message: Message):
             SEARCH_WAITING.discard(uid)
             await message.answer(f"✅ 已保存 {key} = {value}", reply_markup=await reply_menu())
             return
-    if text.lower().startswith("兑换码 "):
-        code = text.split(maxsplit=1)[1].strip().upper()
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT value FROM config WHERE key=?", (f"pending_redeem:{uid}",)) as cur:
+            pending_redeem = await cur.fetchone()
+    if text.lower().startswith("兑换码 ") or pending_redeem:
+        code = (text.split(maxsplit=1)[1] if text.lower().startswith("兑换码 ") else text).strip().upper()
+        if pending_redeem:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("DELETE FROM config WHERE key=?", (f"pending_redeem:{uid}",))
+                await db.commit()
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("BEGIN IMMEDIATE")
             async with db.execute("SELECT points,used_by FROM redemption_codes WHERE code=?", (code,)) as cur:
