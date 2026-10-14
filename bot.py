@@ -343,7 +343,87 @@ def folder_keyboard(fid: str, unlocked: bool, favorite: bool, price: int) -> Inl
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def build_folder_card(fid: str, user_id: int):
+async def fetch_random_folder_resource(fid: str):
+    """Pick one real indexed media message to preview and display its stored title/topic."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """SELECT title,data,chat_id,message_id,file_type,grouped_id
+               FROM source_resources WHERE folder_id=? ORDER BY RANDOM() LIMIT 1""",
+            (fid,),
+        ) as cur:
+            return await cur.fetchone()
+
+
+def resource_labels(resource_info, folder_name: str):
+    """Read topic/title only from stored index metadata; never invent resource titles."""
+    title, raw_data = (resource_info[0], resource_info[1]) if resource_info else ("", "")
+    metadata = {}
+    try:
+        value = json.loads(raw_data or "{}")
+        if isinstance(value, dict):
+            metadata = value
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    topic = str(metadata.get("topic_title") or folder_name or "未分类").strip()
+    caption = str(metadata.get("caption") or "").strip()
+    resource_title = str(title or caption or folder_name or "未命名资源").strip()
+    resource_title = " ".join(resource_title.split())[:220]
+    topic = " ".join(topic.split())[:120]
+    return topic or "未分类", resource_title or str(folder_name or "未命名资源")
+
+
+async def send_random_resource_preview(chat_id: int, fid: str, resource_info) -> int:
+    """Send one actual file or its entire album group; never split a selected album."""
+    if BOT is None:
+        raise RuntimeError("机器人尚未初始化")
+    if not resource_info:
+        raise RuntimeError("这个文件夹没有可预览的资源")
+    _, _, source_chat, message_id, _, grouped_id = resource_info
+    source_chat = str(source_chat)
+    if grouped_id:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                """SELECT message_id FROM source_resources
+                   WHERE folder_id=? AND chat_id=? AND grouped_id=?
+                   ORDER BY message_id""",
+                (fid, source_chat, str(grouped_id)),
+            ) as cur:
+                message_ids = [int(row[0]) for row in await cur.fetchall()]
+        if not message_ids:
+            message_ids = [int(message_id)]
+        if len(message_ids) > 1:
+            sent = await BOT.copy_messages(
+                chat_id=chat_id, from_chat_id=source_chat,
+                message_ids=message_ids, protect_content=True,
+            )
+            return len(sent or [])
+        await BOT.copy_message(
+            chat_id=chat_id, from_chat_id=source_chat,
+            message_id=int(message_ids[0]), protect_content=True,
+        )
+        return 1
+    await BOT.copy_message(
+        chat_id=chat_id, from_chat_id=source_chat,
+        message_id=int(message_id), protect_content=True,
+    )
+    return 1
+
+
+def folder_keyboard(fid: str, unlocked: bool, favorite: bool, price: int) -> InlineKeyboardMarkup:
+    rows = []
+    if unlocked:
+        rows.append([InlineKeyboardButton(text="▶️ 开始浏览资源", callback_data=f"source_browse_start:{fid}")])
+    else:
+        rows.append([InlineKeyboardButton(text=f"🔓 解锁（{price}积分）", callback_data=f"source_unlock:{fid}")])
+    rows.append([
+        InlineKeyboardButton(text="⭐ 已收藏" if favorite else "⭐ 收藏", callback_data=f"fav_toggle:{fid}"),
+        InlineKeyboardButton(text="🎲 再随机", callback_data="source_random_again"),
+    ])
+    rows.append([InlineKeyboardButton(text="📁 返回文件夹列表", callback_data="source_folders_page:0")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def build_folder_card(fid: str, user_id: int, resource_info=None):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT source_folder_id,name,item_count,image_count,video_count,file_count FROM source_folders WHERE source_folder_id=?", (fid,)) as cur:
             folder = await cur.fetchone()
@@ -359,7 +439,10 @@ async def build_folder_card(fid: str, user_id: int):
         async with db.execute("SELECT file_type,grouped_id FROM source_resources WHERE folder_id=?", (fid,)) as cur:
             kinds = await cur.fetchall()
     fid, name, count, images, videos, files = folder
-    # Recompute album groups from indexed resources; album photos are messages, not separate albums.
+    if resource_info is None:
+        resource_info = await fetch_random_folder_resource(str(fid))
+    topic_title, resource_title = resource_labels(resource_info, str(name))
+    # Count album groups, not individual photo messages.
     album_ids = {g for kind, g in kinds if g}
     if kinds:
         count = len(kinds)
@@ -369,6 +452,8 @@ async def build_folder_card(fid: str, user_id: int):
     price = 0 if member_active else max(0, int(await get_config("unlock_price", "10") or 0))
     text = (
         f"📁 {name}\n━━━━━━━━━━━━━━\n"
+        f"🏷️ 话题名称：{topic_title}\n"
+        f"📝 随机资源标题：{resource_title}\n"
         f"🎬 视频消息：{videos} 个\n"
         f"🖼️ 相册组：{len(album_ids)} 组\n"
         f"📄 其他文件：{files} 个\n"
@@ -382,24 +467,43 @@ async def build_folder_card(fid: str, user_id: int):
 async def send_source_folder_card(message: Message, folder, user_id: int | None = None):
     uid = user_id if user_id is not None else message.from_user.id
     fid = str(folder[0])
-    card = await build_folder_card(fid, uid)
+    resource_info = await fetch_random_folder_resource(fid)
+    preview_ok = False
+    preview_error = ""
+    if resource_info:
+        try:
+            await send_random_resource_preview(message.chat.id, fid, resource_info)
+            preview_ok = True
+        except Exception as exc:
+            preview_error = str(exc)[:140]
+            log.warning("随机预览发送失败 folder=%s: %s", fid, preview_error)
+    card = await build_folder_card(fid, uid, resource_info=resource_info)
     if not card:
         await message.answer("找不到这个文件夹，可能已被移除。")
         return False
     text, keyboard = card
-    # Buttons live on a dedicated text card, never on a copied media message.
+    if not resource_info:
+        text += "\n⚠️ 这个文件夹暂时没有可预览的资源。"
+    elif not preview_ok:
+        text += f"\n⚠️ 预览文件发送失败，请点击按钮解锁后浏览。\n原因：{preview_error}"
     await message.answer(text, reply_markup=keyboard)
     return True
 
 
 async def choose_random_source_folder(message: Message, user_id: int | None = None):
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT source_folder_id,name,item_count,image_count,video_count,file_count FROM source_folders WHERE item_count>0 ORDER BY RANDOM() LIMIT 1") as cur:
-            folder = await cur.fetchone()
-    if not folder:
+        async with db.execute(
+            """SELECT source_folder_id,name,item_count,image_count,video_count,file_count
+               FROM source_folders WHERE item_count>0 ORDER BY RANDOM() LIMIT 3"""
+        ) as cur:
+            folders = await cur.fetchall()
+    if not folders:
         await message.answer("资源仓库还没有文件夹，请管理员先导入资源。")
         return False
-    return await send_source_folder_card(message, folder, user_id=user_id)
+    await message.answer(f"🎲 本次为你随机挑选 {len(folders)} 个不同文件夹，先看真实文件预览，再选择解锁或浏览。")
+    for folder in folders:
+        await send_source_folder_card(message, folder, user_id=user_id)
+    return True
 
 
 async def list_source_folders(message: Message, page: int = 0, edit: CallbackQuery | None = None):
