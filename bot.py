@@ -125,6 +125,10 @@ async def init_db() -> None:
             user_id INTEGER NOT NULL, usage_date TEXT NOT NULL, video_count INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY(user_id, usage_date)
         );
+        CREATE TABLE IF NOT EXISTS memberships (
+            user_id INTEGER PRIMARY KEY, expires_at TEXT, granted_by INTEGER,
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
         """)
         # Safe additive migrations for databases created by older versions.
         async with db.execute("PRAGMA table_info(users)") as cur:
@@ -352,6 +356,9 @@ async def build_folder_card(fid: str, user_id: int):
             unlocked = bool(await cur.fetchone())
         async with db.execute("SELECT 1 FROM favorites WHERE user_id=? AND source_folder_id=?", (user_id, fid)) as cur:
             favorite = bool(await cur.fetchone())
+        async with db.execute("SELECT expires_at FROM memberships WHERE user_id=?", (user_id,)) as cur:
+            membership = await cur.fetchone()
+        member_active = bool(membership and (membership[0] is None or membership[0] > now_iso()))
         async with db.execute("SELECT file_type,grouped_id FROM source_resources WHERE folder_id=?", (fid,)) as cur:
             kinds = await cur.fetchall()
     fid, name, count, images, videos, files = folder
@@ -362,14 +369,14 @@ async def build_folder_card(fid: str, user_id: int):
         images = sum(1 for kind, _ in kinds if kind in ("photo", "image"))
         videos = sum(1 for kind, _ in kinds if kind in ("video", "animation"))
         files = sum(1 for kind, _ in kinds if kind not in ("photo", "image", "video", "animation"))
-    price = max(0, int(await get_config("unlock_price", "10") or 0))
+    price = 0 if member_active else max(0, int(await get_config("unlock_price", "10") or 0))
     text = (
         f"📁 {name}\n━━━━━━━━━━━━━━\n"
         f"🎬 视频消息：{videos} 个\n"
         f"🖼️ 相册组：{len(album_ids)} 组\n"
         f"📄 其他文件：{files} 个\n"
         f"📦 资源记录：{count} 条\n"
-        f"🔐 状态：{'已解锁' if unlocked else f'需要 {price} 积分解锁'}\n"
+        f"🔐 状态：{'已解锁' if unlocked else ('会员免费解锁' if member_active else f'需要 {price} 积分解锁')}\n"
         "👇 点击下方按钮继续"
     )
     return text, folder_keyboard(str(fid), unlocked, favorite, price)
@@ -420,6 +427,7 @@ async def list_source_folders(message: Message, page: int = 0, edit: CallbackQue
             nav.append(InlineKeyboardButton(text="下一页 ➡️", callback_data=f"source_folders_page:{page+1}"))
         if nav:
             buttons.append(nav)
+        buttons.append([InlineKeyboardButton(text="🆕 最新资源文件夹", callback_data="source_latest")])
         buttons.append([InlineKeyboardButton(text="🎲 随机推荐", callback_data="source_random_again")])
         text = f"📚 资源文件夹（第 {page+1}/{max(1,(total+page_size-1)//page_size)} 页）\n点击文件夹查看详情、解锁和浏览。"
         kb = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -554,9 +562,13 @@ async def show_user_info(message: Message):
             row = await cur.fetchone()
         async with db.execute("SELECT COUNT(*) FROM favorites WHERE user_id=?", (uid,)) as cur:
             favorites = int((await cur.fetchone())[0] or 0)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT expires_at FROM memberships WHERE user_id=?", (uid,)) as cur:
+            member = await cur.fetchone()
+    member_text = "永久会员" if member and member[0] is None else (f"会员至 {member[0][:10]}" if member and member[0] and member[0] > now_iso() else "普通用户")
     await message.answer(
         f"👤 我的信息\n━━━━━━━━━━━━━━\n🆔 ID：{uid}\n💎 积分：{row[0] if row else 0}\n"
-        f"🔓 已解锁：{row[2] if row else 0} 个文件夹\n⭐ 收藏：{favorites} 个\n"
+        f"🔓 已解锁：{row[2] if row else 0} 个文件夹\n⭐ 收藏：{favorites} 个\n🎟️ 会员：{member_text}\n"
         f"📅 注册时间：{(row[3] or '')[:10] if row else '—'}",
         reply_markup=await reply_menu(),
     )
@@ -596,6 +608,7 @@ async def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📚 资源文件夹", callback_data="source_folders_page:0")],
         [InlineKeyboardButton(text="📡 论坛扫描导入", callback_data="forum_scan_menu")],
         [InlineKeyboardButton(text="📊 资源/用户统计", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="👥 用户与会员管理", callback_data="admin_users_menu")],
         [InlineKeyboardButton(text="🎟️ 生成兑换码", callback_data="admin_code_prompt")],
         [InlineKeyboardButton(text="💾 备份数据库", callback_data="admin_backup")],
     ])
@@ -684,6 +697,28 @@ async def source_folders_page(callback: CallbackQuery):
         page = 0
     await callback.answer()
     await list_source_folders(callback.message, page, edit=callback)
+
+
+@dp.callback_query(F.data.startswith("source_folder:"))@dp.callback_query(F.data == "source_latest")
+async def source_latest(callback: CallbackQuery):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("""
+            SELECT f.source_folder_id,f.name,f.item_count
+            FROM source_folders f LEFT JOIN source_resources r ON r.folder_id=f.source_folder_id
+            WHERE f.item_count>0 GROUP BY f.source_folder_id
+            ORDER BY MAX(r.message_id) DESC LIMIT 10
+        """) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await callback.answer("暂无资源", show_alert=True)
+        return
+    buttons = [[InlineKeyboardButton(text=f"🆕 {str(r[1])[:38]} · {r[2]}", callback_data=f"source_folder:{r[0]}")] for r in rows]
+    buttons.append([InlineKeyboardButton(text="📁 全部文件夹", callback_data="source_folders_page:0")])
+    await callback.answer()
+    try:
+        await callback.message.edit_text("🆕 最新资源文件夹", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    except Exception:
+        await callback.message.answer("🆕 最新资源文件夹", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
 @dp.callback_query(F.data.startswith("source_folder:"))
@@ -989,7 +1024,22 @@ async def admin_set_prompt(callback: CallbackQuery):
     await callback.message.answer(f"{prompt}\n设置项：{key}\n保存后请重新打开菜单。")
 
 
-@dp.callback_query(F.data == "admin_stats")
+@dp.callback_query(F.data == "admin_stats")@dp.callback_query(F.data == "admin_users_menu")
+async def admin_users_menu(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("无权限", show_alert=True)
+        return
+    await callback.answer()
+    await callback.message.answer(
+        "👥 用户与会员管理\\n"
+        "调整积分：发送 /points 用户ID 积分变动（例如 /points 123456 20；扣减用负数）\\n"
+        "发放会员：发送 /member 用户ID 天数（0=永久，例如 /member 123456 30）\\n"
+        "封禁/解封：发送 /ban 用户ID。\\n"
+        "仅管理员可以执行。"
+    )
+
+
+
 async def admin_stats(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("无权限", show_alert=True)
@@ -1044,6 +1094,61 @@ async def text_router(message: Message):
         await message.answer("账号暂时不可用。")
         return
     text = message.text.strip()
+    if is_admin(uid) and text.startswith("/member "):
+        try:
+            _, target_text, days_text = text.split()
+            target, days = int(target_text), int(days_text)
+            if days < 0 or days > 36500:
+                raise ValueError
+        except ValueError:
+            await message.answer("格式：/member 用户ID 天数（0=永久，最多 36500 天）")
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT 1 FROM users WHERE user_id=?", (target,)) as cur:
+                exists = await cur.fetchone()
+            if not exists:
+                await message.answer("用户不存在，请先让用户发送 /start。")
+                return
+            expiry = None if days == 0 else (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+            await db.execute("INSERT INTO memberships(user_id,expires_at,granted_by,updated_at) VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET expires_at=excluded.expires_at,granted_by=excluded.granted_by,updated_at=excluded.updated_at", (target, expiry, uid, now_iso()))
+            await db.commit()
+        await message.answer(f"✅ 已为用户 {target} 发放{'永久会员' if days == 0 else str(days) + ' 天会员'}。")
+        return
+    if is_admin(uid) and text.startswith("/points "):
+        try:
+            _, target_text, amount_text = text.split()
+            target, amount = int(target_text), int(amount_text)
+        except ValueError:
+            await message.answer("格式：/points 用户ID 积分变动，例如 /points 123456 20 或 /points 123456 -5")
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT points FROM users WHERE user_id=?", (target,)) as cur:
+                row = await cur.fetchone()
+            if not row or int(row[0] or 0) + amount < 0:
+                await message.answer("用户不存在，或扣减后积分将低于 0。")
+                return
+            await db.execute("UPDATE users SET points=points+? WHERE user_id=?", (amount, target))
+            await db.execute("INSERT INTO points_log(user_id,amount,reason) VALUES(?,?,?)", (target, amount, f"管理员 {uid} 调整积分"))
+            await db.commit()
+        await message.answer(f"✅ 用户 {target} 积分已变动 {amount:+d}，当前余额 {int(row[0])+amount}。")
+        return
+    if is_admin(uid) and text.startswith("/ban "):
+        try:
+            target = int(text.split()[1])
+        except (ValueError, IndexError):
+            await message.answer("格式：/ban 用户ID")
+            return
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT banned FROM users WHERE user_id=?", (target,)) as cur:
+                row = await cur.fetchone()
+            if not row:
+                await message.answer("用户不存在。")
+                return
+            new_value = 0 if row[0] else 1
+            await db.execute("UPDATE users SET banned=? WHERE user_id=?", (new_value, target))
+            await db.commit()
+        await message.answer(f"已{'封禁' if new_value else '解封'}用户 {target}。")
+        return
     pending_key = f"pending_admin:{uid}"
     if is_admin(uid):
         async with aiosqlite.connect(DB_PATH) as db:
