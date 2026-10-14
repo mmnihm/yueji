@@ -780,8 +780,11 @@ async def source_unlock(callback: CallbackQuery):
             await callback.answer("这个文件夹已经解锁")
         else:
             limit = max(0, int(await get_config("daily_unlock_limit", "0") or 0))
-            price = max(0, int(await get_config("unlock_price", "10") or 0))
-            if limit:
+            async with db.execute("SELECT expires_at FROM memberships WHERE user_id=?", (uid,)) as cur:
+                member_row = await cur.fetchone()
+            member_active = bool(member_row and (member_row[0] is None or member_row[0] > now_iso()))
+            price = 0 if member_active else max(0, int(await get_config("unlock_price", "10") or 0))
+            if limit and not member_active:
                 async with db.execute("SELECT COUNT(*) FROM source_folder_unlocks WHERE user_id=? AND date(unlocked_at)=date('now')", (uid,)) as cur:
                     today_count = int((await cur.fetchone())[0] or 0)
                 if today_count >= limit:
