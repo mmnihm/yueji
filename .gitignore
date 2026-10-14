@@ -1,0 +1,12 @@
+.env
+*.db
+*.db-shm
+*.db-wal
+*.session
+*.session-journal
+forum_reader_alt*
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
