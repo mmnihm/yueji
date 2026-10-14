@@ -442,17 +442,19 @@ async def fetch_random_photo_post(fid: str):
     """Choose one random photo-only post/album from a topic, never selecting video media."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            """SELECT grouped_id
-               FROM source_resources
-               WHERE folder_id=? AND grouped_id IS NOT NULL
-               GROUP BY grouped_id
-               HAVING SUM(CASE WHEN LOWER(file_type) IN ('photo','image') THEN 1 ELSE 0 END) > 0
-                  AND SUM(CASE WHEN LOWER(file_type) NOT IN ('photo','image') THEN 1 ELSE 0 END) = 0
-               UNION ALL
-               SELECT NULL
-               FROM source_resources r
-               WHERE r.folder_id=? AND r.grouped_id IS NULL
-                 AND LOWER(r.file_type) IN ('photo','image')
+            """SELECT grouped_id FROM (
+                   SELECT grouped_id
+                   FROM source_resources
+                   WHERE folder_id=? AND grouped_id IS NOT NULL
+                   GROUP BY grouped_id
+                   HAVING SUM(CASE WHEN LOWER(file_type) IN ('photo','image') THEN 1 ELSE 0 END) > 0
+                      AND SUM(CASE WHEN LOWER(file_type) NOT IN ('photo','image') THEN 1 ELSE 0 END) = 0
+                   UNION ALL
+                   SELECT NULL AS grouped_id
+                   FROM source_resources r
+                   WHERE r.folder_id=? AND r.grouped_id IS NULL
+                     AND LOWER(r.file_type) IN ('photo','image')
+               ) AS photo_posts
                ORDER BY RANDOM() LIMIT 1""",
             (fid, fid),
         ) as cur:
