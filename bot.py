@@ -439,7 +439,7 @@ async def build_folder_card(fid: str, user_id: int, resource_info=None):
     if isinstance(resource_info, list):
         labels = [resource_labels(item, str(name)) for item in resource_info]
         topic_title = labels[0][0] if labels else str(name or "未分类")
-        resource_title = "\\n".join(f"  {idx}. {item_title}" for idx, (_, item_title) in enumerate(labels, 1)) or "暂无"
+        resource_title = "\n".join(f"  {idx}. {item_title}" for idx, (_, item_title) in enumerate(labels, 1)) or "暂无"
     else:
         topic_title, resource_title = resource_labels(resource_info, str(name))
     # Count album groups, not individual photo messages.
@@ -486,13 +486,13 @@ async def send_source_folder_card(message: Message, folder, user_id: int | None 
         return False
     text, keyboard = card
     if not resources:
-        text += "\\n⚠️ 这个话题暂时没有可预览的文件。"
+        text += "\n⚠️ 这个话题暂时没有可预览的文件。"
     elif preview_count == 0:
-        text += "\\n⚠️ 文件发送失败，请检查机器人是否有权限访问来源频道。"
+        text += "\n⚠️ 文件发送失败，请检查机器人是否有权限访问来源频道。"
         if preview_errors:
-            text += f"\\n原因：{preview_errors[0]}"
+            text += f"\n原因：{preview_errors[0]}"
     elif preview_errors:
-        text += f"\\n⚠️ 有 {len(preview_errors)} 个文件发送失败，其余已发送。"
+        text += f"\n⚠️ 有 {len(preview_errors)} 个文件发送失败，其余已发送。"
     await message.answer(text, reply_markup=keyboard)
     return True
 
