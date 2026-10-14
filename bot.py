@@ -329,19 +329,28 @@ async def sync_source_repository():
     raise RuntimeError("当前版本未启用旧 MySQL 仓库同步，请使用管理员的论坛扫描导入功能。")
 
 
-async def fetch_random_folder_resource(fid: str):
-    """Pick one real indexed media message to preview and display its stored title/topic."""
+async def fetch_random_folder_resources(fid: str, limit: int = 3):
+    """Choose up to three random files from one topic, treating each album as one item."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             """SELECT title,data,chat_id,message_id,file_type,grouped_id
-               FROM source_resources WHERE folder_id=? ORDER BY RANDOM() LIMIT 1""",
-            (fid,),
+               FROM source_resources AS r
+               WHERE folder_id=? AND (
+                   grouped_id IS NULL OR grouped_id='' OR message_id=(
+                       SELECT MIN(r2.message_id) FROM source_resources AS r2
+                       WHERE r2.folder_id=r.folder_id
+                         AND r2.chat_id=r.chat_id
+                         AND r2.grouped_id=r.grouped_id
+                   )
+               )
+               ORDER BY RANDOM() LIMIT ?""",
+            (fid, max(1, int(limit))),
         ) as cur:
-            return await cur.fetchone()
+            return await cur.fetchall()
 
 
 def resource_labels(resource_info, folder_name: str):
-    """Read topic/title only from stored index metadata; never invent resource titles."""
+    """Read topic/title from stored metadata, with safe fallbacks."""
     title, raw_data = (resource_info[0], resource_info[1]) if resource_info else ("", "")
     metadata = {}
     try:
@@ -363,7 +372,7 @@ async def send_random_resource_preview(chat_id: int, fid: str, resource_info) ->
     if BOT is None:
         raise RuntimeError("机器人尚未初始化")
     if not resource_info:
-        raise RuntimeError("这个文件夹没有可预览的资源")
+        raise RuntimeError("这个话题没有可预览的资源")
     _, _, source_chat, message_id, _, grouped_id = resource_info
     source_chat = str(source_chat)
     if grouped_id:
@@ -426,8 +435,13 @@ async def build_folder_card(fid: str, user_id: int, resource_info=None):
             kinds = await cur.fetchall()
     fid, name, count, images, videos, files = folder
     if resource_info is None:
-        resource_info = await fetch_random_folder_resource(str(fid))
-    topic_title, resource_title = resource_labels(resource_info, str(name))
+        resource_info = (await fetch_random_folder_resources(str(fid), limit=1) or [None])[0]
+    if isinstance(resource_info, list):
+        labels = [resource_labels(item, str(name)) for item in resource_info]
+        topic_title = labels[0][0] if labels else str(name or "未分类")
+        resource_title = "\\n".join(f"  {idx}. {item_title}" for idx, (_, item_title) in enumerate(labels, 1)) or "暂无"
+    else:
+        topic_title, resource_title = resource_labels(resource_info, str(name))
     # Count album groups, not individual photo messages.
     album_ids = {g for kind, g in kinds if g}
     if kinds:
@@ -453,25 +467,32 @@ async def build_folder_card(fid: str, user_id: int, resource_info=None):
 async def send_source_folder_card(message: Message, folder, user_id: int | None = None):
     uid = user_id if user_id is not None else message.from_user.id
     fid = str(folder[0])
-    resource_info = await fetch_random_folder_resource(fid)
-    preview_ok = False
-    preview_error = ""
-    if resource_info:
+    resources = await fetch_random_folder_resources(fid, limit=3)
+    preview_count = 0
+    preview_errors = []
+    for idx, resource_info in enumerate(resources, 1):
+        _, resource_title = resource_labels(resource_info, str(folder[1]))
         try:
+            await message.answer(f"📝 第 {idx} 个文件：{resource_title}")
             await send_random_resource_preview(message.chat.id, fid, resource_info)
-            preview_ok = True
+            preview_count += 1
         except Exception as exc:
-            preview_error = str(exc)[:140]
-            log.warning("随机预览发送失败 folder=%s: %s", fid, preview_error)
-    card = await build_folder_card(fid, uid, resource_info=resource_info)
+            err = str(exc)[:140]
+            preview_errors.append(err)
+            log.warning("随机预览发送失败 folder=%s item=%s: %s", fid, idx, err)
+    card = await build_folder_card(fid, uid, resource_info=resources)
     if not card:
-        await message.answer("找不到这个文件夹，可能已被移除。")
+        await message.answer("找不到这个话题，可能已被移除。")
         return False
     text, keyboard = card
-    if not resource_info:
-        text += "\n⚠️ 这个文件夹暂时没有可预览的资源。"
-    elif not preview_ok:
-        text += f"\n⚠️ 预览文件发送失败，请点击按钮解锁后浏览。\n原因：{preview_error}"
+    if not resources:
+        text += "\\n⚠️ 这个话题暂时没有可预览的文件。"
+    elif preview_count == 0:
+        text += "\\n⚠️ 文件发送失败，请检查机器人是否有权限访问来源频道。"
+        if preview_errors:
+            text += f"\\n原因：{preview_errors[0]}"
+    elif preview_errors:
+        text += f"\\n⚠️ 有 {len(preview_errors)} 个文件发送失败，其余已发送。"
     await message.answer(text, reply_markup=keyboard)
     return True
 
@@ -480,15 +501,14 @@ async def choose_random_source_folder(message: Message, user_id: int | None = No
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             """SELECT source_folder_id,name,item_count,image_count,video_count,file_count
-               FROM source_folders WHERE item_count>0 ORDER BY RANDOM() LIMIT 3"""
+               FROM source_folders WHERE item_count>0 ORDER BY RANDOM() LIMIT 1"""
         ) as cur:
-            folders = await cur.fetchall()
-    if not folders:
-        await message.answer("资源仓库还没有文件夹，请管理员先导入资源。")
+            folder = await cur.fetchone()
+    if not folder:
+        await message.answer("资源仓库还没有话题，请管理员先导入资源。")
         return False
-    await message.answer(f"🎲 本次为你随机挑选 {len(folders)} 个不同文件夹，先看真实文件预览，再选择解锁或浏览。")
-    for folder in folders:
-        await send_source_folder_card(message, folder, user_id=user_id)
+    await message.answer("🎲 已随机选中 1 个话题，从该话题中随机抽取最多 3 个文件，每个文件附带标题。")
+    await send_source_folder_card(message, folder, user_id=user_id)
     return True
 
 
