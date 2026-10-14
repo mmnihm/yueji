@@ -10,8 +10,9 @@ if [ -f "$DB_FILE" ]; then
   cp -a "$DB_FILE" "/root/yueji-backups/yueji.db.$(date +%Y%m%d-%H%M%S).bak"
 fi
 git fetch origin main
-git checkout main
-git pull --ff-only origin main
+git checkout -f main 2>/dev/null || git checkout -B main origin/main
+git reset --hard origin/main
+git clean -fd
 python3 -m venv .venv 2>/dev/null || true
 . .venv/bin/activate
 pip install --upgrade pip

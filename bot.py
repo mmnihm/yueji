@@ -189,10 +189,7 @@ def menu_label(key: str) -> str:
 async def reply_menu() -> ReplyKeyboardMarkup:
     order_raw = await get_config("menu_order", DEFAULTS["menu_order"])
     order = [k.strip() for k in order_raw.split(",") if k.strip() in MENU_KEYS]
-    order = list(dict.fromkeys(order))
-    for key in MENU_KEYS:
-        if key not in order:
-            order.append(key)
+    order = list(dict.fromkeys(order)) or list(MENU_KEYS)
     if (await get_config("menu_show_random", "1")) != "1":
         order = [k for k in order if k != "random"]
     labels = {k: await get_config(MENU_CONFIG[k], DEFAULTS[MENU_CONFIG[k]]) for k in MENU_KEYS}
@@ -654,6 +651,11 @@ async def start(message: Message):
     welcome = await get_config("welcome_text", DEFAULTS["welcome_text"])
     announcement = await get_config("announcement_text", "")
     await message.answer(welcome + (f"\n\n📣 {announcement}" if announcement else ""), reply_markup=await reply_menu())
+    service_url = await get_config("customer_service_url", "")
+    if service_url:
+        await message.answer("🧑‍💻 客服入口", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="联系在线客服", url=service_url)]
+        ]))
 
 
 @dp.message(Command("help"))
