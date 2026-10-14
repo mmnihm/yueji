@@ -438,39 +438,112 @@ async def build_folder_card(fid: str, user_id: int, resource_info=None):
     return text, folder_keyboard(str(fid), unlocked, favorite, price)
 
 
+async def fetch_random_photo_post(fid: str):
+    """Choose one random photo-only post/album from a topic, never selecting video media."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """SELECT grouped_id
+               FROM source_resources
+               WHERE folder_id=? AND grouped_id IS NOT NULL
+               GROUP BY grouped_id
+               HAVING SUM(CASE WHEN LOWER(file_type) IN ('photo','image') THEN 1 ELSE 0 END) > 0
+                  AND SUM(CASE WHEN LOWER(file_type) NOT IN ('photo','image') THEN 1 ELSE 0 END) = 0
+               UNION ALL
+               SELECT NULL
+               FROM source_resources r
+               WHERE r.folder_id=? AND r.grouped_id IS NULL
+                 AND LOWER(r.file_type) IN ('photo','image')
+               ORDER BY RANDOM() LIMIT 1""",
+            (fid, fid),
+        ) as cur:
+            picked = await cur.fetchone()
+        if not picked:
+            return []
+        grouped_id = picked[0]
+        if grouped_id is None:
+            async with db.execute(
+                """SELECT title,data,chat_id,message_id,file_type,grouped_id
+                   FROM source_resources
+                   WHERE folder_id=? AND grouped_id IS NULL
+                     AND LOWER(file_type) IN ('photo','image')
+                   ORDER BY RANDOM() LIMIT 1""",
+                (fid,),
+            ) as cur:
+                return await cur.fetchall()
+        async with db.execute(
+            """SELECT title,data,chat_id,message_id,file_type,grouped_id
+               FROM source_resources
+               WHERE folder_id=? AND grouped_id=?
+                 AND LOWER(file_type) IN ('photo','image')
+               ORDER BY message_id""",
+            (fid, grouped_id),
+        ) as cur:
+            return await cur.fetchall()
+
+
 async def send_source_folder_card(message: Message, folder, user_id: int | None = None):
-    """Send only up to three random photos from the selected topic, with each title as caption."""
-    fid = str(folder[0])
-    resources = await fetch_random_folder_resources(fid, limit=3)
-    if not resources:
-        await message.answer("这个话题暂时没有可发送的图片。")
+    """Pick one random topic, then send one complete original photo post/album with title only."""
+    if BOT is None:
+        await message.answer("机器人尚未初始化，请稍后再试。")
         return False
-    sent_count = 0
-    errors = []
-    for resource_info in resources:
-        try:
-            await send_random_resource_preview(message.chat.id, fid, resource_info)
-            sent_count += 1
-        except Exception as exc:
-            err = str(exc)[:140]
-            errors.append(err)
-            log.warning("随机图片发送失败 folder=%s: %s", fid, err)
-    if sent_count == 0:
-        await message.answer("图片发送失败，请检查机器人是否有权限访问来源频道。")
-        if errors:
-            await message.answer(f"原因：{errors[0]}")
-    return sent_count > 0
+    fid, folder_name = str(folder[0]), str(folder[1])
+    resources = await fetch_random_photo_post(fid)
+    if not resources:
+        await message.answer("这个话题暂时没有纯图片帖子可发送。")
+        return False
+
+    # Keep every photo in the original album together. The source album's grouped_id
+    # identifies the complete post; copy_messages preserves Telegram media grouping.
+    source_chat = str(resources[0][2])
+    message_ids = sorted({int(row[3]) for row in resources})
+    _, title = resource_labels(resources[0], folder_name)
+    try:
+        copied = await BOT.copy_messages(
+            chat_id=message.chat.id,
+            from_chat_id=source_chat,
+            message_ids=message_ids,
+            protect_content=True,
+        )
+        if not copied:
+            await message.answer("这条图片帖子发送失败，请稍后再试。")
+            return False
+
+        # Replace any long/source caption with the post title only, without adding
+        # a separate title message. Telegram permits editing the first album caption.
+        first = copied[0]
+        if title:
+            try:
+                await BOT.edit_message_caption(
+                    chat_id=message.chat.id,
+                    message_id=first.message_id,
+                    caption=title[:1024],
+                )
+            except Exception as exc:
+                log.warning("随机图片标题更新失败 folder=%s: %s", fid, str(exc)[:140])
+        return True
+    except Exception as exc:
+        log.warning("随机图片帖子发送失败 folder=%s: %s", fid, str(exc)[:180])
+        await message.answer("图片帖子发送失败，请检查机器人是否有权限访问来源论坛。")
+        return False
 
 
 async def choose_random_source_folder(message: Message, user_id: int | None = None):
+    """Choose one random topic, then one random photo-only post inside it."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            """SELECT source_folder_id,name,item_count,image_count,video_count,file_count
-               FROM source_folders WHERE image_count>0 ORDER BY RANDOM() LIMIT 1"""
+            """SELECT f.source_folder_id,f.name,f.item_count,f.image_count,f.video_count,f.file_count
+               FROM source_folders f
+               WHERE f.image_count>0
+                 AND EXISTS (
+                     SELECT 1 FROM source_resources r
+                     WHERE r.folder_id=f.source_folder_id
+                       AND LOWER(r.file_type) IN ('photo','image')
+                 )
+               ORDER BY RANDOM() LIMIT 1"""
         ) as cur:
             folder = await cur.fetchone()
     if not folder:
-        await message.answer("资源仓库里暂时没有可随机发送的图片。")
+        await message.answer("资源仓库里暂时没有可随机发送的图片帖子。")
         return False
     return await send_source_folder_card(message, folder, user_id=user_id)
 
