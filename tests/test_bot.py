@@ -89,6 +89,20 @@ class YuejiBotSmokeTests(unittest.IsolatedAsyncioTestCase):
                 columns = {row[1] for row in await cur.fetchall()}
         self.assertIn("grouped_id", columns)
 
+    async def test_random_resource_labels_use_stored_topic_and_title(self):
+        topic, title = app.resource_labels((
+            "Stored file title",
+            '{"topic_title":"Stored topic","caption":"Caption fallback"}',
+            "-100123", 42, "video", None,
+        ), "Folder fallback")
+        self.assertEqual(topic, "Stored topic")
+        self.assertEqual(title, "Stored file title")
+
+    async def test_random_resource_labels_fallback_to_folder_name(self):
+        topic, title = app.resource_labels(None, "Folder fallback")
+        self.assertEqual(topic, "Folder fallback")
+        self.assertEqual(title, "Folder fallback")
+
     async def test_resource_page_does_not_split_album(self):
         rows = [(str(-1001), i, "photo", None) for i in range(1, 10)]
         rows.extend([

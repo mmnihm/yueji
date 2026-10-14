@@ -329,20 +329,6 @@ async def sync_source_repository():
     raise RuntimeError("当前版本未启用旧 MySQL 仓库同步，请使用管理员的论坛扫描导入功能。")
 
 
-def folder_keyboard(fid: str, unlocked: bool, favorite: bool, price: int) -> InlineKeyboardMarkup:
-    rows = []
-    if unlocked:
-        rows.append([InlineKeyboardButton(text="▶️ 开始浏览资源", callback_data=f"source_browse_start:{fid}")])
-    else:
-        rows.append([InlineKeyboardButton(text=f"🔓 解锁（{price}积分）", callback_data=f"source_unlock:{fid}")])
-    rows.append([
-        InlineKeyboardButton(text="⭐ 已收藏" if favorite else "⭐ 收藏", callback_data=f"fav_toggle:{fid}"),
-        InlineKeyboardButton(text="🎲 再随机", callback_data="source_random_again"),
-    ])
-    rows.append([InlineKeyboardButton(text="📁 返回文件夹列表", callback_data="source_folders_page:0")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
 async def fetch_random_folder_resource(fid: str):
     """Pick one real indexed media message to preview and display its stored title/topic."""
     async with aiosqlite.connect(DB_PATH) as db:
