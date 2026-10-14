@@ -439,49 +439,40 @@ async def build_folder_card(fid: str, user_id: int, resource_info=None):
 
 
 async def send_source_folder_card(message: Message, folder, user_id: int | None = None):
-    uid = user_id if user_id is not None else message.from_user.id
+    """Send only up to three random photos from the selected topic, with each title as caption."""
     fid = str(folder[0])
     resources = await fetch_random_folder_resources(fid, limit=3)
-    preview_count = 0
-    preview_errors = []
-    for idx, resource_info in enumerate(resources, 1):
+    if not resources:
+        await message.answer("这个话题暂时没有可发送的图片。")
+        return False
+    sent_count = 0
+    errors = []
+    for resource_info in resources:
         try:
             await send_random_resource_preview(message.chat.id, fid, resource_info)
-            preview_count += 1
+            sent_count += 1
         except Exception as exc:
             err = str(exc)[:140]
-            preview_errors.append(err)
-            log.warning("随机预览发送失败 folder=%s item=%s: %s", fid, idx, err)
-    card = await build_folder_card(fid, uid, resource_info=resources)
-    if not card:
-        await message.answer("找不到这个话题，可能已被移除。")
-        return False
-    text, keyboard = card
-    if not resources:
-        text += "\n⚠️ 这个话题暂时没有可预览的文件。"
-    elif preview_count == 0:
-        text += "\n⚠️ 文件发送失败，请检查机器人是否有权限访问来源频道。"
-        if preview_errors:
-            text += f"\n原因：{preview_errors[0]}"
-    elif preview_errors:
-        text += f"\n⚠️ 有 {len(preview_errors)} 个文件发送失败，其余已发送。"
-    await message.answer(text, reply_markup=keyboard)
-    return True
+            errors.append(err)
+            log.warning("随机图片发送失败 folder=%s: %s", fid, err)
+    if sent_count == 0:
+        await message.answer("图片发送失败，请检查机器人是否有权限访问来源频道。")
+        if errors:
+            await message.answer(f"原因：{errors[0]}")
+    return sent_count > 0
 
 
 async def choose_random_source_folder(message: Message, user_id: int | None = None):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             """SELECT source_folder_id,name,item_count,image_count,video_count,file_count
-               FROM source_folders WHERE item_count>0 ORDER BY RANDOM() LIMIT 1"""
+               FROM source_folders WHERE image_count>0 ORDER BY RANDOM() LIMIT 1"""
         ) as cur:
             folder = await cur.fetchone()
     if not folder:
-        await message.answer("资源仓库还没有话题，请管理员先导入资源。")
+        await message.answer("资源仓库里暂时没有可随机发送的图片。")
         return False
-    await message.answer("🎲 已随机选中 1 个话题，正在发送其中随机抽取的最多 3 张图片。")
-    await send_source_folder_card(message, folder, user_id=user_id)
-    return True
+    return await send_source_folder_card(message, folder, user_id=user_id)
 
 
 async def list_source_folders(message: Message, page: int = 0, edit: CallbackQuery | None = None):
