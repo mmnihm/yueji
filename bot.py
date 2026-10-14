@@ -699,7 +699,7 @@ async def source_folders_page(callback: CallbackQuery):
     await list_source_folders(callback.message, page, edit=callback)
 
 
-@dp.callback_query(F.data.startswith("source_folder:"))@dp.callback_query(F.data == "source_latest")
+@dp.callback_query(F.data == "source_latest")
 async def source_latest(callback: CallbackQuery):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("""
@@ -1024,22 +1024,23 @@ async def admin_set_prompt(callback: CallbackQuery):
     await callback.message.answer(f"{prompt}\n设置项：{key}\n保存后请重新打开菜单。")
 
 
-@dp.callback_query(F.data == "admin_stats")@dp.callback_query(F.data == "admin_users_menu")
+@dp.callback_query(F.data == "admin_users_menu")
 async def admin_users_menu(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("无权限", show_alert=True)
         return
     await callback.answer()
     await callback.message.answer(
-        "👥 用户与会员管理\\n"
-        "调整积分：发送 /points 用户ID 积分变动（例如 /points 123456 20；扣减用负数）\\n"
-        "发放会员：发送 /member 用户ID 天数（0=永久，例如 /member 123456 30）\\n"
-        "封禁/解封：发送 /ban 用户ID。\\n"
+        "👥 用户与会员管理\n"
+        "调整积分：发送 /points 用户ID 积分变动（例如 /points 123456 20；扣减用负数）\n"
+        "发放会员：发送 /member 用户ID 天数（0=永久，例如 /member 123456 30）\n"
+        "封禁/解封：发送 /ban 用户ID。\n"
         "仅管理员可以执行。"
     )
 
 
 
+@dp.callback_query(F.data == "admin_stats")
 async def admin_stats(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("无权限", show_alert=True)
