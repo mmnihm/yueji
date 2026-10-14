@@ -2,7 +2,8 @@
 set -Eeuo pipefail
 cd /root/yueji
 test -f .env || { echo "缺少 /root/yueji/.env，先配置 BOT_TOKEN 和 ADMIN_ID"; exit 1; }
-DB_FILE="${YUEJI_DB:-/root/yueji/yueji.db}"
+DB_FILE="$(grep -m1 '^YUEJI_DB=' .env 2>/dev/null | sed 's/^YUEJI_DB=//' | sed 's/^"//;s/"$//' || true)"
+DB_FILE="${DB_FILE:-/root/yueji/yueji.db}"
 case "$DB_FILE" in /*) ;; *) DB_FILE="/root/yueji/$DB_FILE" ;; esac
 mkdir -p /root/yueji-backups
 if [ -f "$DB_FILE" ]; then
